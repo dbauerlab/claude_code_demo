@@ -235,6 +235,36 @@ res_df <- res_shrink |>
 head(res_df, 10)
 ```
 
+## Gene-symbol annotation
+
+Map Ensembl gene IDs to HGNC symbols using `org.Hs.eg.db` — fully offline (no
+biomaRt / network call). A `label` column carries the symbol when available and
+falls back to the Ensembl ID otherwise; it is used for the plot labels below.
+
+```{r}
+#| label: annotate
+
+if (requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  suppressPackageStartupMessages(library(org.Hs.eg.db))
+  res_df$symbol <- mapIds(org.Hs.eg.db,
+                          keys = res_df$gene_id,
+                          column = "SYMBOL",
+                          keytype = "ENSEMBL",
+                          multiVals = "first")
+  message(sprintf("Annotated %d of %d genes with HGNC symbols.",
+                  sum(!is.na(res_df$symbol)), nrow(res_df)))
+} else {
+  res_df$symbol <- NA_character_
+  message("org.Hs.eg.db not installed - keeping Ensembl IDs only.")
+}
+
+res_df <- res_df |>
+  mutate(label = ifelse(is.na(symbol) | symbol == "", gene_id, symbol)) |>
+  relocate(symbol, label, .after = gene_id)
+
+head(res_df, 10)
+```
+
 # Diagnostics
 
 ```{r}
@@ -288,7 +318,7 @@ p_volc <- ggplot(volc, aes(log2FoldChange, -log10(padj), colour = sig)) +
   scale_colour_manual(values = c(Up = "#c0392b", Down = "#2471a3", NS = "grey70")) +
   geom_vline(xintercept = c(-lfc_thresh, lfc_thresh), linetype = "dashed", colour = "grey50") +
   geom_hline(yintercept = -log10(alpha_padj), linetype = "dashed", colour = "grey50") +
-  ggrepel::geom_text_repel(data = top_lab, aes(label = gene_id),
+  ggrepel::geom_text_repel(data = top_lab, aes(label = label),
                            size = 2.6, max.overlaps = 20, show.legend = FALSE) +
   labs(x = "log2 fold change (Dex vs Untreated)",
        y = "-log10 adjusted p-value", colour = NULL,
@@ -309,6 +339,7 @@ top_genes <- res_df |> filter(!is.na(padj)) |> slice_min(padj, n = 30) |> pull(g
 
 mat <- assay(vsd)[top_genes, ]
 mat <- t(scale(t(mat)))  # row z-score
+rownames(mat) <- res_df$label[match(top_genes, res_df$gene_id)]  # symbol labels
 
 ann_col <- as.data.frame(colData(dds)[, c("treatment", "cellLine")])
 
@@ -321,31 +352,6 @@ dev.off()
 pheatmap(mat, annotation_col = ann_col,
          show_colnames = FALSE, fontsize_row = 7,
          main = "Top 30 DE genes (VST z-score)")
-```
-
-# Optional: gene-symbol annotation
-
-If `org.Hs.eg.db` is installed, map Ensembl gene IDs to HGNC symbols. This is
-fully offline (no biomaRt / network call). If the package is absent, the table
-keeps Ensembl IDs only.
-
-```{r}
-#| label: annotate
-
-if (requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
-  suppressPackageStartupMessages(library(org.Hs.eg.db))
-  res_df$symbol <- mapIds(org.Hs.eg.db,
-                          keys = res_df$gene_id,
-                          column = "SYMBOL",
-                          keytype = "ENSEMBL",
-                          multiVals = "first")
-  res_df <- res_df |> relocate(symbol, .after = gene_id)
-  message("Annotated with HGNC symbols via org.Hs.eg.db.")
-} else {
-  message("org.Hs.eg.db not installed - keeping Ensembl IDs only.")
-}
-
-head(res_df, 10)
 ```
 
 # Export outputs

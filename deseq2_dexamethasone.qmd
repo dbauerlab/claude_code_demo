@@ -1,0 +1,297 @@
+---
+title: "Bulk RNA-seq Differential Expression: Dexamethasone vs Untreated"
+subtitle: "Airway smooth muscle cells, 4 donors, paired design (DESeq2)"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+## About this dataset
+
+Airway smooth muscle cells from 4 donors (`cellLine`), each with one `Untreated` sample and
+one `Dexamethasone`-treated sample (`treatment`) — the well-known "airway" dataset (Himes et
+al.). Gene-level counts come from RSEM (`data/rsem.merged.gene_counts.tsv`); sample metadata
+is in `data/experiment_table.csv`.
+
+Because each donor contributes both conditions, this is a **paired design**: the model below
+blocks on `cellLine` so that donor-to-donor variability doesn't obscure the treatment effect.
+
+```{r}
+#| label: setup
+library(DESeq2)
+library(apeglm)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# Thresholds for calling a gene "significant" — change these to re-run with different cutoffs.
+PADJ_THRESHOLD <- 0.05
+LFC_THRESHOLD <- 1
+```
+
+## Load and prepare data
+
+```{r}
+#| label: load-data
+counts_raw <- read_tsv("data/rsem.merged.gene_counts.tsv", show_col_types = FALSE)
+
+count_mat <- counts_raw |>
+  dplyr::select(-`transcript_id(s)`) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+# RSEM reports non-integer "expected counts" (e.g. 340.80); DESeq2 requires integer counts.
+count_mat <- round(count_mat)
+
+coldata <- read_csv("data/experiment_table.csv", show_col_types = FALSE) |>
+  column_to_rownames("ID")
+
+# Align sample order and hard-fail if the ID join between the two files doesn't line up.
+count_mat <- count_mat[, rownames(coldata)]
+stopifnot(identical(colnames(count_mat), rownames(coldata)))
+
+# "Untreated" as the reference level so fold changes read as Dexamethasone vs Untreated.
+coldata$treatment <- factor(coldata$treatment, levels = c("Untreated", "Dexamethasone"))
+coldata$cellLine <- factor(coldata$cellLine)
+
+coldata
+```
+
+```{r}
+#| label: prefilter
+keep <- rowSums(count_mat) >= 10
+cat(sprintf(
+  "Keeping %d of %d genes after low-count filtering (rowSums >= 10).\n",
+  sum(keep), length(keep)
+))
+count_mat <- count_mat[keep, ]
+```
+
+```{r}
+#| label: build-dds
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData = coldata,
+  design = ~ cellLine + treatment
+)
+dds
+```
+
+## Quality control
+
+### Library sizes
+
+```{r}
+#| label: qc-libsize
+#| fig-cap: "Total counts per sample"
+lib_sizes <- colSums(counts(dds)) |>
+  enframe(name = "sample", value = "library_size") |>
+  left_join(as.data.frame(colData(dds)) |> rownames_to_column("sample"), by = "sample")
+
+ggplot(lib_sizes, aes(x = sample, y = library_size, fill = treatment)) +
+  geom_col() +
+  labs(title = "Library size per sample", x = NULL, y = "Total counts") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### PCA
+
+Variance-stabilizing transformation (`vst`, blind to the design) followed by PCA. If the
+design is doing what we expect, samples should separate more by donor (`cellLine`, driving
+most of the variance between individuals) and/or by `treatment`.
+
+```{r}
+#| label: qc-pca
+#| fig-cap: "PCA of VST-normalized counts"
+vsd <- vst(dds, blind = TRUE)
+
+pca_data <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = treatment, shape = cellLine)) +
+  geom_point(size = 4) +
+  labs(
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance"),
+    title = "PCA of VST-normalized counts"
+  ) +
+  theme_minimal()
+```
+
+### Sample-to-sample distances
+
+```{r}
+#| label: qc-distance
+#| fig-cap: "Sample-to-sample distances (VST)"
+sample_dist <- dist(t(assay(vsd)))
+dist_mat <- as.matrix(sample_dist)
+rownames(dist_mat) <- paste(vsd$treatment, vsd$cellLine, sep = " - ")
+colnames(dist_mat) <- NULL
+
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pheatmap(
+  dist_mat,
+  clustering_distance_rows = sample_dist,
+  clustering_distance_cols = sample_dist,
+  col = colors,
+  main = "Sample-to-sample distances (VST)"
+)
+```
+
+## Differential expression
+
+```{r}
+#| label: run-deseq
+dds <- DESeq(dds)
+plotDispEsts(dds, main = "Dispersion estimates")
+```
+
+```{r}
+#| label: results
+res <- results(dds, contrast = c("treatment", "Dexamethasone", "Untreated"), alpha = PADJ_THRESHOLD)
+summary(res)
+```
+
+Shrink the log2 fold changes with `apeglm` — this pulls in noisy fold-change estimates for
+low-count genes without touching genes with strong evidence, which is why the coefficient
+below is used for reporting/plots rather than the raw Wald-test result above.
+
+```{r}
+#| label: shrink
+stopifnot("treatment_Dexamethasone_vs_Untreated" %in% resultsNames(dds))
+res_shrunk <- lfcShrink(dds, coef = "treatment_Dexamethasone_vs_Untreated", type = "apeglm")
+```
+
+### Annotate with gene symbols
+
+The count matrix only has Ensembl gene IDs. We map them to gene symbols via `org.Hs.eg.db`,
+keeping both columns in every output table — symbol for readability, Ensembl ID as the
+unambiguous key (some IDs won't have a current symbol; those fall back to showing the
+Ensembl ID).
+
+```{r}
+#| label: annotate
+symbols <- mapIds(org.Hs.eg.db, keys = rownames(res_shrunk), column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+
+res_df <- as.data.frame(res_shrunk) |>
+  rownames_to_column("gene_id") |>
+  as_tibble() |>
+  mutate(
+    symbol = symbols[gene_id],
+    label = if_else(is.na(symbol), gene_id, symbol),
+    significant = !is.na(padj) & padj < PADJ_THRESHOLD & abs(log2FoldChange) >= LFC_THRESHOLD
+  ) |>
+  relocate(symbol, .after = gene_id) |>
+  arrange(padj)
+
+n_sig <- sum(res_df$significant, na.rm = TRUE)
+cat(sprintf(
+  "%d genes significant at padj < %.2f and |log2FC| >= %.1f\n",
+  n_sig, PADJ_THRESHOLD, LFC_THRESHOLD
+))
+
+res_df
+```
+
+### Sanity check against known biology
+
+`FKBP5`, `TSC22D3`, `DUSP1`, and `PER1` are well-established glucocorticoid-responsive genes
+in this dataset — they should show up here as strongly, significantly upregulated. If they
+don't, something upstream (sample/ID alignment, factor levels, contrast direction) is wrong.
+
+```{r}
+#| label: sanity-check
+res_df |>
+  filter(symbol %in% c("FKBP5", "TSC22D3", "DUSP1", "PER1")) |>
+  dplyr::select(gene_id, symbol, log2FoldChange, padj, significant)
+```
+
+## Visualization
+
+### MA plot
+
+```{r}
+#| label: ma-plot
+#| fig-cap: "MA plot (shrunken log2 fold changes)"
+plotMA(res_shrunk, alpha = PADJ_THRESHOLD, main = "MA plot (shrunken LFC)")
+```
+
+### Volcano plot
+
+```{r}
+#| label: volcano
+#| fig-cap: "Volcano plot: Dexamethasone vs Untreated"
+plot_df <- res_df |> filter(!is.na(padj))
+top_labels <- plot_df |> filter(significant) |> slice_min(padj, n = 10)
+
+ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "grey70"), guide = "none") +
+  geom_vline(xintercept = c(-LFC_THRESHOLD, LFC_THRESHOLD), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(PADJ_THRESHOLD), linetype = "dashed", color = "grey40") +
+  geom_text_repel(data = top_labels, aes(label = label), size = 3, max.overlaps = 20) +
+  labs(
+    title = "Volcano plot: Dexamethasone vs Untreated",
+    x = "log2 fold change (shrunken)", y = "-log10(adjusted p-value)"
+  ) +
+  theme_minimal()
+```
+
+### Heatmap of top differentially expressed genes
+
+```{r}
+#| label: heatmap-top-genes
+#| fig-cap: "Top 30 differentially expressed genes (VST, row z-score)"
+top_genes <- plot_df |> slice_min(padj, n = 30) |> pull(gene_id)
+
+mat <- assay(vsd)[top_genes, ]
+mat <- t(scale(t(mat)))
+rownames(mat) <- res_df$label[match(top_genes, res_df$gene_id)]
+
+annotation_col <- as.data.frame(colData(vsd)[, c("treatment", "cellLine")])
+
+pheatmap(
+  mat,
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  main = "Top 30 differentially expressed genes (VST, row z-score)"
+)
+```
+
+## Export results
+
+```{r}
+#| label: export
+dir.create("results", showWarnings = FALSE)
+
+write_csv(res_df, "results/de_results_all.csv")
+write_csv(filter(res_df, significant), "results/de_results_significant.csv")
+
+norm_counts <- counts(dds, normalized = TRUE) |>
+  as.data.frame() |>
+  rownames_to_column("gene_id")
+write_csv(norm_counts, "results/normalized_counts.csv")
+
+cat("Wrote results/de_results_all.csv, results/de_results_significant.csv, results/normalized_counts.csv\n")
+```
+
+## Session info
+
+```{r}
+#| label: session-info
+sessioninfo::session_info()
+```

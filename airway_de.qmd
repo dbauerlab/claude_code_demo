@@ -1,0 +1,365 @@
+---
+title: "Airway RNA-seq: Dexamethasone vs Untreated"
+subtitle: "Bulk differential expression — clawbio (PyDESeq2) engine, R reporting"
+author: "dbauerlab"
+date: today
+format: html
+engine: knitr
+params:
+  counts:      "data/rsem.merged.gene_counts.tsv"
+  metadata:    "data/experiment_table.csv"
+  clawbio_dir: "~/.claude/plugins/marketplaces/clawbio"
+  python:      "python3.12"
+  formula:     "~ cellLine + treatment"
+  contrast:    "treatment,Dexamethasone,Untreated"
+  min_count:   10
+  min_samples: 2
+  padj:        0.05
+  lfc:         1
+---
+
+```{r setup}
+#| include: false
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(tibble); library(tidyr)
+  library(ggplot2); library(pheatmap); library(jsonlite); library(DT); library(knitr)
+})
+theme_set(theme_bw(base_size = 12))
+
+# Resolve paths and output directories
+clawbio_dir <- path.expand(params$clawbio_dir)
+out_prepared   <- "outputs/prepared"
+out_de         <- "outputs/clawbio_de"
+out_enrichment <- "outputs/clawbio_enrichment"
+for (d in c(out_prepared, out_de, out_enrichment)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+rnaseq_de_py <- file.path(clawbio_dir, "skills", "rnaseq-de", "rnaseq_de.py")
+enricher_py  <- file.path(clawbio_dir, "skills", "pathway-enricher", "pathway_enricher.py")
+stopifnot("clawbio rnaseq-de script not found — check params$clawbio_dir" = file.exists(rnaseq_de_py))
+```
+
+## Overview
+
+This report runs a complete **bulk RNA-seq differential expression** analysis on the
+[airway](https://doi.org/10.1371/journal.pone.0099625) dataset — human airway smooth
+muscle cells, **Dexamethasone vs Untreated**, across four donor cell lines (a balanced,
+paired design).
+
+The **differential-expression engine is [clawbio](https://github.com/ClawBio/ClawBio)'s
+`rnaseq-de` skill**, which computes statistics with **PyDESeq2** (a re-implementation of
+the DESeq2 method). R prepares inputs, ingests clawbio's results, and produces all
+visualizations. Downstream **pathway enrichment** uses clawbio's `pathway-enricher` skill.
+
+Statistical conventions (per `CLAUDE.md`) are honored throughout: integer counts, the
+paired design `` `r params$formula` ``, and `Untreated` as the reference level (encoded by
+the contrast direction `` `r params$contrast` ``).
+
+## 1 · Prepare inputs
+
+RSEM emits fractional *expected counts*; PyDESeq2 requires integers. We drop the
+`transcript_id(s)` column, **round to integers**, verify the counts↔metadata join on
+sample ID, and **reorder count columns to match the metadata** (never assume column order).
+
+```{r prepare-inputs}
+raw_counts <- read_tsv(params$counts, show_col_types = FALSE)
+meta       <- read_csv(params$metadata, show_col_types = FALSE)
+
+# --- validate the sample-ID join (CLAUDE.md gotcha) ---
+sample_ids   <- meta$ID
+count_samples <- setdiff(names(raw_counts), c("gene_id", "transcript_id(s)"))
+stopifnot(
+  "Sample IDs in metadata not all present in counts" = all(sample_ids %in% count_samples),
+  "Counts contain samples missing from metadata"     = all(count_samples %in% sample_ids)
+)
+
+# --- build integer count matrix: gene_id + samples, reordered to metadata order ---
+counts_int <- raw_counts |>
+  # Name the id column 'gene': clawbio's PyDESeq2 path keys on that exact name
+  # (it sets the DataFrame index from column 1 and expects to recover a 'gene'
+  # column). Also drops transcript_id(s); column order follows metadata order.
+  select(gene = gene_id, all_of(sample_ids)) |>
+  mutate(across(all_of(sample_ids), \(x) as.integer(round(x))))
+
+# --- clawbio-ready inputs ---
+# counts: gene id in column 1, then samples (.tsv -> tab-delimited)
+write_tsv(counts_int, file.path(out_prepared, "counts.tsv"))
+# metadata: must contain 'sample_id'; keep the formula's factor columns by name
+meta_out <- meta |> transmute(sample_id = ID, cellLine, treatment)
+write_csv(meta_out, file.path(out_prepared, "metadata.csv"))
+
+kable(meta_out, caption = "Experimental design (8 samples = 4 donors × 2 treatments)")
+```
+
+```{r design-check}
+meta_out |> count(cellLine, treatment) |> tidyr::pivot_wider(names_from = treatment, values_from = n) |>
+  kable(caption = "Balance check: one sample per donor × treatment")
+```
+
+## 2 · Differential expression — clawbio `rnaseq-de` (PyDESeq2)
+
+We invoke the clawbio skill directly on the prepared inputs. This is the authoritative
+DE step; everything downstream reads its outputs from `` `r out_de` ``.
+
+```{r run-clawbio-de}
+#| results: hold
+if (Sys.which(params$python) == "")
+  stop(sprintf("Python interpreter '%s' not found. Run scripts/setup.sh first.", params$python))
+
+# clawbio refuses to write into a non-empty directory — start clean each render.
+unlink(out_de, recursive = TRUE); dir.create(out_de, recursive = TRUE, showWarnings = FALSE)
+
+de_args <- c(
+  rnaseq_de_py,
+  "--counts",      file.path(out_prepared, "counts.tsv"),
+  "--metadata",    file.path(out_prepared, "metadata.csv"),
+  "--formula",     params$formula,
+  "--contrast",    params$contrast,
+  "--backend",     "pydeseq2",
+  "--min-count",   params$min_count,
+  "--min-samples", params$min_samples,
+  "--output",      out_de
+)
+# system2() does NOT shell-quote args; the formula "~ cellLine + treatment" has
+# spaces, so quote every element to keep it a single argv entry.
+de_log <- system2(params$python, shQuote(de_args), stdout = TRUE, stderr = TRUE)
+writeLines(de_log, file.path(out_de, "run.log"))
+# The skill prints a JSON run-summary on stdout; persist it for provenance.
+json_lines <- de_log[cumsum(grepl("^\\{", de_log)) > 0]
+if (length(json_lines)) writeLines(json_lines, file.path(out_de, "summary.json"))
+
+de_csv <- file.path(out_de, "tables", "de_results.csv")
+if (!file.exists(de_csv)) {
+  cat(tail(de_log, 25), sep = "\n")
+  stop("clawbio rnaseq-de did not produce de_results.csv — see log above.")
+}
+cat("clawbio backend:",
+    tryCatch(fromJSON(file.path(out_de, "summary.json"))$backend, error = \(e) "pydeseq2"), "\n")
+```
+
+## 3 · Ingest results & annotate
+
+```{r ingest}
+de <- read_csv(de_csv, show_col_types = FALSE)          # gene, baseMean, log2FoldChange, [lfcSE, stat,] pvalue, padj
+qc <- read_csv(file.path(out_de, "tables", "qc_summary.csv"), show_col_types = FALSE)
+norm <- read.csv(file.path(out_de, "tables", "normalized_counts.csv"),
+                 row.names = 1, check.names = FALSE)     # log2(CPM+1), genes × samples
+
+# Ensembl ENSG -> gene SYMBOL (offline via org.Hs.eg.db; graceful fallback to IDs)
+de <- de |> mutate(ensembl = sub("\\..*$", "", gene))
+if (requireNamespace("org.Hs.eg.db", quietly = TRUE) && requireNamespace("AnnotationDbi", quietly = TRUE)) {
+  sym <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db,
+                               keys = unique(de$ensembl), keytype = "ENSEMBL",
+                               column = "SYMBOL", multiVals = "first")
+  de$symbol <- unname(sym[de$ensembl])
+} else {
+  message("org.Hs.eg.db not installed — using Ensembl IDs as labels.")
+  de$symbol <- NA_character_
+}
+de$symbol <- ifelse(is.na(de$symbol) | de$symbol == "", de$ensembl, de$symbol)
+de <- de |> relocate(symbol, .after = gene)
+```
+
+## 4 · Quality control
+
+```{r qc-table}
+kable(qc, caption = "Per-sample QC (from clawbio)")
+```
+
+```{r qc-plots, fig.width=9, fig.height=4}
+qc_long <- qc |>
+  transmute(sample_id, `Library size` = library_size, `Detected genes` = detected_genes) |>
+  left_join(meta_out, by = "sample_id") |>
+  pivot_longer(c(`Library size`, `Detected genes`), names_to = "metric", values_to = "value")
+ggplot(qc_long, aes(sample_id, value, fill = treatment)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(x = NULL, y = NULL, title = "Library size & gene detection") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 5 · PCA
+
+PCA on clawbio's log-normalized expression. We expect samples to separate by treatment,
+with the four donors pairing up (the reason the model controls for `cellLine`).
+
+```{r pca, fig.width=7, fig.height=5}
+pc  <- prcomp(t(as.matrix(norm)), scale. = FALSE)
+ve  <- round(100 * pc$sdev^2 / sum(pc$sdev^2), 1)
+pca_df <- as.data.frame(pc$x[, 1:2]) |>
+  rownames_to_column("sample_id") |>
+  left_join(meta_out, by = "sample_id")
+ggplot(pca_df, aes(PC1, PC2, color = treatment, shape = cellLine)) +
+  geom_point(size = 4) +
+  labs(title = "PCA of log-normalized expression",
+       x = sprintf("PC1 (%.1f%%)", ve[1]), y = sprintf("PC2 (%.1f%%)", ve[2]))
+```
+
+## 6 · Differential expression results
+
+```{r de-summary}
+padj_cut <- params$padj; lfc_cut <- params$lfc
+de <- de |> mutate(
+  sig = !is.na(padj) & padj < padj_cut & abs(log2FoldChange) > lfc_cut,
+  direction = case_when(!sig ~ "ns", log2FoldChange > 0 ~ "up", TRUE ~ "down")
+)
+summ <- de |> summarise(
+  tested = sum(!is.na(padj)),
+  significant = sum(sig),
+  up = sum(direction == "up"),
+  down = sum(direction == "down")
+)
+kable(summ, caption = sprintf("DE summary (padj < %g and |log2FC| > %g)", padj_cut, lfc_cut))
+```
+
+```{r de-table}
+de |> filter(sig) |> arrange(padj) |>
+  transmute(gene, symbol, baseMean = round(baseMean, 1),
+            log2FoldChange = round(log2FoldChange, 3), pvalue, padj) |>
+  datatable(rownames = FALSE, filter = "top",
+            caption = "Significant genes (sortable / searchable)",
+            options = list(pageLength = 15)) |>
+  formatSignif(c("pvalue", "padj"), 3)
+```
+
+```{r positive-controls}
+controls <- c("DUSP1","KLF15","PER1","ZBTB16","TSC22D3","FKBP5","CEACAM5","SPARCL1")
+de |> filter(symbol %in% controls) |> arrange(padj) |>
+  transmute(symbol, log2FoldChange = round(log2FoldChange, 2), padj, significant = sig) |>
+  kable(caption = "Known dexamethasone / glucocorticoid-responsive genes (positive controls)")
+```
+
+```{r volcano, fig.width=7, fig.height=6}
+top_lab <- de |> filter(sig) |> slice_min(padj, n = 15)
+ggplot(de, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(color = direction), alpha = 0.5, size = 0.9) +
+  scale_color_manual(values = c(ns = "grey70", up = "#c0392b", down = "#2471a3")) +
+  geom_vline(xintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", color = "grey50") +
+  { if (requireNamespace("ggrepel", quietly = TRUE))
+      ggrepel::geom_text_repel(data = top_lab, aes(label = symbol), size = 3, max.overlaps = 20)
+    else geom_text(data = top_lab, aes(label = symbol), size = 3, vjust = -0.5) } +
+  labs(title = "Volcano: Dexamethasone vs Untreated",
+       x = "log2 fold change", y = "-log10 p-value", color = NULL)
+```
+
+```{r ma-plot, fig.width=7, fig.height=5}
+ggplot(de, aes(log2(baseMean + 1), log2FoldChange)) +
+  geom_point(aes(color = direction), alpha = 0.5, size = 0.9) +
+  scale_color_manual(values = c(ns = "grey70", up = "#c0392b", down = "#2471a3")) +
+  geom_hline(yintercept = 0, color = "grey40") +
+  labs(title = "MA plot", x = "log2(mean expression + 1)", y = "log2 fold change", color = NULL)
+```
+
+```{r heatmap, fig.width=8, fig.height=7}
+top_genes <- de |> filter(sig) |> slice_min(padj, n = 40)
+if (nrow(top_genes) >= 2) {
+  mat <- as.matrix(norm[top_genes$gene, , drop = FALSE])
+  rownames(mat) <- make.unique(top_genes$symbol)
+  ann <- meta_out |> column_to_rownames("sample_id") |> select(treatment, cellLine)
+  pheatmap(mat, scale = "row", annotation_col = ann,
+           show_colnames = TRUE, fontsize_row = 7,
+           main = "Top 40 DE genes (row-scaled log-normalized expression)")
+} else {
+  cat("Fewer than 2 significant genes — skipping heatmap.")
+}
+```
+
+## 7 · Pathway enrichment
+
+Significant gene symbols are tested for pathway/GO enrichment against Enrichr
+(GO Biological Process, KEGG, Reactome). We try clawbio's `pathway-enricher`
+first; if it fails (its Enrichr upload is form-encoded and 400s on large lists),
+we fall back to `gseapy.enrichr()`, which uses the correct multipart API. This
+step needs network access; if none is available the report degrades gracefully.
+
+```{r enrichment-run}
+sig_symbols <- de |> filter(sig, !is.na(symbol)) |> distinct(symbol) |> pull(symbol)
+sig_symbols <- sig_symbols[!grepl("^ENSG", sig_symbols)]  # need real symbols for Enrichr
+writeLines(sig_symbols, file.path(out_prepared, "sig_genes.txt"))
+
+enr <- NULL; enrich_source <- "none"
+run_ok <- function(cmd_args, logfile)
+  tryCatch(identical(as.integer(system2(params$python, shQuote(cmd_args),
+             stdout = logfile, stderr = logfile)), 0L), error = function(e) FALSE)
+
+if (length(sig_symbols) >= 5) {
+  unlink(out_enrichment, recursive = TRUE); dir.create(out_enrichment, recursive = TRUE, showWarnings = FALSE)
+
+  # 1) clawbio pathway-enricher
+  if (file.exists(enricher_py) &&
+      run_ok(c(enricher_py, "--input", file.path(out_prepared, "sig_genes.txt"),
+               "--output", out_enrichment), file.path(out_enrichment, "clawbio.log"))) {
+    tabs <- list.files(file.path(out_enrichment, "tables"), pattern = "_enrichment\\.csv$", full.names = TRUE)
+    got <- lapply(tabs, function(tf) {
+      d <- tryCatch(read_csv(tf, show_col_types = FALSE), error = function(e) NULL)
+      if (is.null(d) || nrow(d) == 0) return(NULL)
+      tibble(library = sub("_enrichment\\.csv$", "", basename(tf)),
+             term = d[["term"]] %||% d[["Term"]],
+             adj_pvalue = suppressWarnings(as.numeric(d[["adj_pvalue"]] %||% d[["Adjusted P-value"]])),
+             genes = d[["genes"]] %||% NA_character_)
+    })
+    got <- bind_rows(got)
+    if (nrow(got)) { enr <- got; enrich_source <- "clawbio pathway-enricher" }
+  }
+
+  # 2) gseapy fallback
+  if (is.null(enr) &&
+      run_ok(c("scripts/enrich_gseapy.py", file.path(out_prepared, "sig_genes.txt"), out_enrichment),
+             file.path(out_enrichment, "gseapy.log"))) {
+    f <- file.path(out_enrichment, "gseapy_enrichment.csv")
+    if (file.exists(f)) {
+      d <- read_csv(f, show_col_types = FALSE)
+      enr <- tibble(library = d$library, term = d$Term,
+                    adj_pvalue = as.numeric(d$adj_pvalue),
+                    overlap = d$Overlap, genes = d$Genes)
+      enrich_source <- "gseapy.enrichr (fallback)"
+    }
+  }
+}
+```
+
+```{r enrichment-show, fig.width=9, fig.height=6}
+if (!is.null(enr) && nrow(enr)) {
+  cat(sprintf("Enrichment computed via **%s** — %d terms across %d libraries.\n\n",
+              enrich_source, nrow(enr), dplyr::n_distinct(enr$library)))
+
+  top_terms <- enr |> filter(!is.na(adj_pvalue)) |>
+    group_by(library) |> slice_min(adj_pvalue, n = 8, with_ties = FALSE) |> ungroup() |>
+    mutate(term = factor(term, levels = rev(unique(term[order(adj_pvalue)]))))
+
+  print(
+    ggplot(top_terms, aes(-log10(adj_pvalue), term, fill = library)) +
+      geom_col() +
+      facet_wrap(~ library, scales = "free_y", ncol = 1) +
+      labs(title = "Top enriched terms per library", x = "-log10(adjusted p)", y = NULL) +
+      theme(legend.position = "none")
+  )
+} else {
+  cat("> Enrichment skipped — no enrichment service reachable (clawbio + gseapy both failed),",
+      "or too few significant genes. The gene list is saved at `outputs/prepared/sig_genes.txt`.\n")
+}
+```
+
+```{r enrichment-table}
+if (!is.null(enr) && nrow(enr)) {
+  enr |> filter(!is.na(adj_pvalue)) |> arrange(adj_pvalue) |>
+    transmute(library, term, adj_pvalue) |>
+    datatable(rownames = FALSE, filter = "top",
+              caption = "All enriched terms (sortable / searchable)",
+              options = list(pageLength = 15)) |>
+    formatSignif("adj_pvalue", 3)
+}
+```
+
+## 8 · Provenance
+
+```{r provenance}
+cat("Python:", system2(params$python, "--version", stdout = TRUE, stderr = TRUE), "\n\n")
+# clawbio ships a reproducibility bundle alongside its results:
+list.files(file.path(out_de, "reproducibility"))
+```
+
+```{r session-info}
+# Final annotated results are written for downstream use.
+write_csv(de |> arrange(padj), file.path(out_de, "de_results_annotated.csv"))
+sessionInfo()
+```

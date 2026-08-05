@@ -1,0 +1,21 @@
+project:
+  title: "Airway RNA-seq Differential Expression"
+  output-dir: .
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    df-print: paged
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+
+execute:
+  warning: false
+  message: false
+  freeze: false

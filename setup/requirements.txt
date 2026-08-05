@@ -1,0 +1,18 @@
+# Python dependencies for analyze.py
+#
+#   pip install -r setup/requirements.txt
+#
+# PyDESeq2 pulls in anndata, pandas, numpy, and scipy as dependencies; they are listed
+# here explicitly because analyze.py imports them directly.
+
+pydeseq2>=0.4.0
+pandas>=1.5
+numpy>=1.23
+scipy>=1.9
+matplotlib>=3.6
+
+# Optional: gene-symbol annotation (Ensembl ID -> symbol), offline after a one-time
+# data install. Without it, analyze.py labels everything with Ensembl IDs. Enable with:
+#   pip install pyensembl
+#   pyensembl install --release 110 --species homo_sapiens
+# pyensembl>=2.2

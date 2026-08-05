@@ -3,14 +3,18 @@ title: "Differential expression: Dexamethasone vs Untreated"
 subtitle: "Human airway smooth muscle cells (Himes et al. 2014), paired design across 4 donors"
 format:
   html:
+    theme: [cosmo, custom.scss]
     embed-resources: true
     toc: true
     toc-depth: 3
+    toc-location: left
     code-fold: true
     code-tools: true
     fig-width: 7
     fig-height: 5
+    fig-dpi: 150
     df-print: kable
+    tbl-cap-location: bottom
 execute:
   warning: false
   message: false
@@ -31,6 +35,36 @@ dir.create("results/tables",  recursive = TRUE, showWarnings = FALSE)
 dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
 
 ALPHA <- 0.05  # FDR threshold used throughout
+
+# ---- Purple-anchored palette (ColorBrewer Purples / PuOr; colourblind-safe) ----
+# One purple/orange pair carries meaning across every figure:
+#   purple = Dexamethasone / up-regulated, orange = Untreated / down-regulated.
+PURPLE <- "#6a3d9a"
+ORANGE <- "#e08214"
+GREY   <- "#c4c0cc"
+
+pal_treatment <- c(Untreated = ORANGE, Dexamethasone = PURPLE)
+pal_direction <- c(
+  "Up in Dexamethasone"   = PURPLE,
+  "Down in Dexamethasone" = ORANGE,
+  "Not significant"       = GREY
+)
+
+# Sequential purple ramp for distances; diverging orange<->purple for centred heatmaps.
+seq_purples <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "Purples")))(255)
+div_puor    <- colorRampPalette(RColorBrewer::brewer.pal(11, "PuOr"))(255)  # low=orange, high=purple
+
+# Shared ggplot theme so PCA and volcano share one clean look.
+theme_report <- theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(colour = "grey92"),
+    plot.title    = element_text(face = "bold", colour = "#3f1f6b"),
+    axis.title    = element_text(colour = "#26232b"),
+    legend.position = "top",
+    legend.title  = element_text(face = "bold")
+  )
+theme_set(theme_report)
 ```
 
 ## Experimental design
@@ -220,14 +254,17 @@ pca_data <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRU
 pct_var <- round(100 * attr(pca_data, "percentVar"))
 
 p_pca <- ggplot(pca_data, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
-  geom_point(size = 4, alpha = 0.9) +
-  scale_colour_brewer(palette = "Set1") +
+  geom_point(size = 4.5, alpha = 0.9, stroke = 1.1) +
+  scale_colour_manual(values = pal_treatment) +
+  scale_shape_manual(values = c(16, 17, 15, 18)) +
   labs(
+    title = "PCA of variance-stabilised counts",
     x = paste0("PC1: ", pct_var[1], "% variance"),
     y = paste0("PC2: ", pct_var[2], "% variance"),
     colour = "Treatment", shape = "Cell line"
   ) +
-  theme_bw(base_size = 12)
+  # Two legends don't fit across the top of a 7-inch figure; stack them at the right.
+  theme(legend.position = "right", legend.box = "vertical")
 
 p_pca
 ggsave("results/figures/pca.png", p_pca, width = 7, height = 5, dpi = 150)
@@ -251,25 +288,19 @@ dist_mat <- as.matrix(sample_dists)
 rownames(dist_mat) <- paste(vsd$cellLine, vsd$treatment, sep = " / ")
 colnames(dist_mat) <- colnames(vsd)
 
-dist_colours <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
-
-pheatmap(
-  dist_mat,
+dist_args <- list(
+  mat = dist_mat,
   clustering_distance_rows = sample_dists,
   clustering_distance_cols = sample_dists,
-  col = dist_colours,
+  col = seq_purples,   # dark purple = close, pale = distant
+  border_color = "white",
   main = "Sample-to-sample distances (VST)"
 )
 
-pheatmap(
-  dist_mat,
-  clustering_distance_rows = sample_dists,
-  clustering_distance_cols = sample_dists,
-  col = dist_colours,
-  main = "Sample-to-sample distances (VST)",
-  filename = "results/figures/sample_distances.png",
-  width = 7, height = 6
-)
+do.call(pheatmap, dist_args)
+do.call(pheatmap, c(dist_args, list(
+  filename = "results/figures/sample_distances.png", width = 7, height = 6
+)))
 ```
 
 The dendrogram splits first into two clean blocks of four — all untreated on one side, all
@@ -291,16 +322,18 @@ stopifnot(resultsNames_expected %in% resultsNames(dds))
 ```{r}
 #| label: fig-dispersion
 #| fig-cap: "Per-gene dispersion estimates, with the fitted trend and shrunken final values."
-plotDispEsts(dds, main = "Dispersion estimates")
+plotDispEsts(dds, main = "Dispersion estimates",
+             genecol = GREY, fitcol = ORANGE, finalcol = PURPLE)
 
 png("results/figures/dispersion.png", width = 7, height = 5, units = "in", res = 150)
-plotDispEsts(dds, main = "Dispersion estimates")
+plotDispEsts(dds, main = "Dispersion estimates",
+             genecol = GREY, fitcol = ORANGE, finalcol = PURPLE)
 invisible(dev.off())
 ```
 
-A healthy plot shows dispersion falling as mean expression rises, with gene-wise estimates
-shrunk toward the fitted red trend. Points flagged in blue at the top are dispersion outliers,
-which DESeq2 deliberately leaves unshrunken.
+A healthy plot shows dispersion falling as mean expression rises: the per-gene estimates (grey)
+are shrunk toward the fitted trend (orange) to give the final values (purple). Genes whose
+dispersion sits far above the trend are flagged as outliers and left unshrunken.
 
 ### Results
 
@@ -455,12 +488,14 @@ repressed direction.
 
 ```{r}
 #| label: fig-ma
-#| fig-cap: "MA plot on shrunken fold changes. Blue points pass the FDR threshold."
+#| fig-cap: "MA plot on shrunken fold changes. Purple points pass the FDR threshold."
 plotMA(res_shrunk, alpha = ALPHA, ylim = c(-6, 6),
+       colNonSig = GREY, colSig = PURPLE, colLine = ORANGE,
        main = "MA plot (apeglm-shrunken log2 fold changes)")
 
 png("results/figures/ma_plot.png", width = 7, height = 5, units = "in", res = 150)
 plotMA(res_shrunk, alpha = ALPHA, ylim = c(-6, 6),
+       colNonSig = GREY, colSig = PURPLE, colLine = ORANGE,
        main = "MA plot (apeglm-shrunken log2 fold changes)")
 invisible(dev.off())
 ```
@@ -492,25 +527,30 @@ volcano_df$label <- ifelse(is.na(volcano_df$symbol), volcano_df$gene_id, volcano
 
 label_df <- head(volcano_df[volcano_df$padj < ALPHA, ], 15)
 
+# Draw significant points on top of the grey background so they read clearly.
+volcano_df$significant <- factor(
+  volcano_df$significant,
+  levels = c("Not significant", "Down in Dexamethasone", "Up in Dexamethasone")
+)
+volcano_df <- volcano_df[order(volcano_df$significant), ]
+
 p_volcano <- ggplot(volcano_df, aes(log2FoldChange_shrunk, -log10(padj_plot))) +
-  geom_point(aes(colour = significant), size = 1, alpha = 0.6) +
-  geom_hline(yintercept = -log10(ALPHA), linetype = "dashed", colour = "grey40") +
+  geom_point(aes(colour = significant), size = 1.4, alpha = 0.7) +
+  geom_hline(yintercept = -log10(ALPHA), linetype = "dashed", colour = "grey45") +
   geom_text_repel(
     data = label_df, aes(label = label),
-    size = 3, max.overlaps = Inf, min.segment.length = 0, box.padding = 0.4
+    size = 3.2, fontface = "italic", colour = "#26232b",
+    max.overlaps = Inf, min.segment.length = 0, box.padding = 0.4,
+    segment.colour = "grey60"
   ) +
-  scale_colour_manual(values = c(
-    "Up in Dexamethasone"   = "#D62728",
-    "Down in Dexamethasone" = "#1F77B4",
-    "Not significant"       = "grey75"
-  )) +
+  scale_colour_manual(values = pal_direction, breaks = names(pal_direction)) +
   labs(
-    x = "log2 fold change (Dexamethasone vs Untreated, shrunken)",
+    title = "Dexamethasone vs Untreated",
+    x = "log2 fold change (shrunken)",
     y = expression(-log[10]~adjusted~italic(p)),
     colour = NULL
   ) +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "top")
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)))
 
 p_volcano
 ggsave("results/figures/volcano.png", p_volcano, width = 7, height = 6, dpi = 150)
@@ -542,9 +582,28 @@ annotation_col <- data.frame(
   row.names = colnames(mat)
 )
 
+# Treatment colours match the rest of the report; donors get a light purple ramp.
+cellline_levels <- levels(colData(vsd)$cellLine)
+cellline_cols <- setNames(
+  colorRampPalette(brewer.pal(9, "Purples")[4:8])(length(cellline_levels)),
+  cellline_levels
+)
+annotation_colors <- list(
+  Treatment = c(Untreated = ORANGE, Dexamethasone = PURPLE),
+  CellLine  = cellline_cols
+)
+
+# Symmetric breaks so 0 sits on the neutral midpoint of the diverging ramp.
+max_abs <- max(abs(mat))
+breaks <- seq(-max_abs, max_abs, length.out = 256)
+
 heatmap_args <- list(
   mat = mat,
+  color = div_puor,               # orange = down, purple = up
+  breaks = breaks,
   annotation_col = annotation_col,
+  annotation_colors = annotation_colors,
+  border_color = NA,
   show_colnames = TRUE,
   cluster_cols = TRUE,
   fontsize_row = 8,

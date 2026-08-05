@@ -1,0 +1,74 @@
+/*-- scss:defaults --*/
+// Purple-anchored theme for the DE report.
+// Palette drawn from ColorBrewer Purples / PuOr (published colorblind-safe references).
+
+$purple-900: #3f1f6b;
+$purple-700: #6a3d9a;
+$purple-500: #8659b5;
+$purple-100: #efe9f6;
+$orange-500: #e08214;
+
+$primary:      $purple-700;
+$link-color:   $purple-700;
+$body-color:   #26232b;
+$body-bg:      #ffffff;
+
+// Slightly larger, calmer body type.
+$font-size-root: 17px;
+$line-height-base: 1.65;
+$headings-font-weight: 600;
+$toc-color: $purple-700;
+$toc-active-border: $purple-700;
+
+/*-- scss:rules --*/
+
+// Content column: a touch narrower for comfortable line length.
+.page-columns .content { max-width: 46rem; }
+
+h1.title {
+  color: $purple-900;
+  border-bottom: 3px solid $purple-700;
+  padding-bottom: 0.35rem;
+}
+
+.subtitle, p.subtitle {
+  color: $purple-500;
+  font-weight: 400;
+}
+
+h2 {
+  color: $purple-900;
+  margin-top: 2.2rem;
+  padding-bottom: 0.2rem;
+  border-bottom: 1px solid $purple-100;
+}
+
+h3 { color: $purple-700; }
+
+// Links and the active TOC entry.
+a { color: $purple-700; }
+a:hover { color: $purple-900; }
+#TOC .active, .sidebar nav[role="doc-toc"] ul > li > a.active {
+  color: $purple-900;
+  border-left: 2px solid $purple-700;
+}
+
+// Tables (df-print: kable -> bootstrap tables): purple header, soft zebra striping.
+table.table thead tr {
+  background-color: $purple-700;
+  color: #ffffff;
+}
+table.table tbody tr:nth-child(odd) { background-color: $purple-100; }
+table.table td, table.table th { padding: 0.4rem 0.6rem; }
+
+// Code-fold buttons and inline code accents.
+.code-fold summary, details > summary {
+  color: $purple-700;
+}
+code:not(.sourceCode) { color: $purple-900; }
+
+// Blockquote / callout accent.
+blockquote {
+  border-left: 4px solid $purple-500;
+  color: #4a4552;
+}

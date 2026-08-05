@@ -234,28 +234,33 @@ ggsave(file.path(results_dir, "pca.png"), p_pca, width = 7, height = 5, dpi = 15
 #| label: fig-sample-dist
 #| fig-cap: "Euclidean distances between samples on VST-transformed counts."
 
+# pheatmap returns a grob invisibly and does not always get captured by knitr
+# when also writing to a file. Build it once with silent = TRUE, save the grob
+# to PNG explicitly, then grid.draw it so the figure appears inline too.
+save_pheatmap_png <- function(ph, filename, width = 7, height = 6, res = 150) {
+  png(filename, width = width, height = height, units = "in", res = res)
+  grid::grid.newpage()
+  grid::grid.draw(ph$gtable)
+  invisible(dev.off())
+}
+
 sample_dists <- dist(t(assay(vsd)))
 dist_mat <- as.matrix(sample_dists)
 rownames(dist_mat) <- paste(vsd$treatment, vsd$cellLine, sep = " | ")
 colnames(dist_mat) <- rownames(dist_mat)
 
-pheatmap(
+ph_dist <- pheatmap(
   dist_mat,
   clustering_distance_rows = sample_dists,
   clustering_distance_cols = sample_dists,
   col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
   main = "Sample-to-sample distances",
-  filename = file.path(results_dir, "sample_distance_heatmap.png"),
-  width = 7, height = 6
+  silent = TRUE
 )
-# Also draw inline (pheatmap writes to file when `filename` is set, so call again).
-pheatmap(
-  dist_mat,
-  clustering_distance_rows = sample_dists,
-  clustering_distance_cols = sample_dists,
-  col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
-  main = "Sample-to-sample distances"
-)
+save_pheatmap_png(ph_dist, file.path(results_dir, "sample_distance_heatmap.png"),
+                  width = 7, height = 6)
+grid::grid.newpage()
+grid::grid.draw(ph_dist$gtable)  # inline figure
 ```
 
 # Differential expression results
@@ -360,20 +365,17 @@ mat <- t(scale(t(mat)))  # row-scale (z-score per gene)
 
 annot_col <- as.data.frame(colData(vsd)[, c("treatment", "cellLine")])
 
-pheatmap(
+ph_top <- pheatmap(
   mat,
   annotation_col = annot_col,
   show_colnames = FALSE,
   main = "Top 30 DE genes (VST, row-scaled)",
-  filename = file.path(results_dir, "top_genes_heatmap.png"),
-  width = 8, height = 8
+  silent = TRUE
 )
-pheatmap(
-  mat,
-  annotation_col = annot_col,
-  show_colnames = FALSE,
-  main = "Top 30 DE genes (VST, row-scaled)"
-)
+save_pheatmap_png(ph_top, file.path(results_dir, "top_genes_heatmap.png"),
+                  width = 8, height = 8)
+grid::grid.newpage()
+grid::grid.draw(ph_top$gtable)  # inline figure
 ```
 
 # Export results

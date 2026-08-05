@@ -1,0 +1,351 @@
+---
+title: "Airway RNA-seq: Dexamethasone vs Untreated (DESeq2)"
+subtitle: "Paired design, blocked on cell line"
+author: "Catarina Nunes"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    df-print: paged
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+## Overview
+
+Differential expression for the **airway** experiment: primary human airway smooth
+muscle cells treated with **dexamethasone** (a glucocorticoid) versus **untreated**
+controls. The design is **paired** — each of 4 donor cell lines contributes one
+untreated and one treated sample — so we block on `cellLine` and test `treatment`:
+
+$$\text{design} = \sim\ \text{cellLine} + \text{treatment}$$
+
+`Untreated` is the reference level, so a **positive log2 fold change means induced by
+dexamethasone**.
+
+Inputs (see `CLAUDE.md`):
+
+- `data/rsem.merged.gene_counts.tsv` — RSEM merged gene-level **expected counts**
+  (fractional; rounded to integers below), ~58.7k genes × 8 samples.
+- `data/experiment_table.csv` — sample sheet (`ID`, `cellLine`, `treatment`).
+
+All outputs are written to `results/`.
+
+## Setup
+
+Install any missing CRAN / Bioconductor packages, then load them.
+
+```{r setup}
+#| label: setup
+pkgs_cran <- c("ggplot2", "pheatmap", "RColorBrewer", "ggrepel", "matrixStats")
+pkgs_bioc <- c("DESeq2", "apeglm", "org.Hs.eg.db", "AnnotationDbi")
+
+install_if_missing <- function(pkgs, bioc = FALSE) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) == 0) return(invisible())
+  if (bioc) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(missing, update = FALSE, ask = FALSE)
+  } else {
+    install.packages(missing)
+  }
+}
+
+install_if_missing(pkgs_cran, bioc = FALSE)
+install_if_missing(pkgs_bioc, bioc = TRUE)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ggrepel)
+  library(apeglm)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+})
+
+# Output locations
+dir.create("results", showWarnings = FALSE)
+fig_dir <- file.path("results")
+
+# Analysis parameters
+ALPHA        <- 0.05   # FDR threshold
+LFC_THRESH   <- 0      # log2FC threshold for calling DE (0 = any direction)
+MIN_ROWSUM   <- 10     # pre-filter: keep genes with total counts >= this
+N_TOP_HEATMAP <- 30    # genes shown in the DE heatmap
+
+theme_set(theme_bw(base_size = 12))
+```
+
+## 1. Load inputs
+
+```{r load}
+#| label: load-data
+counts_raw <- read.delim("data/rsem.merged.gene_counts.tsv",
+                         check.names = FALSE, stringsAsFactors = FALSE)
+
+# Drop non-count columns; gene IDs -> rownames
+stopifnot(all(c("gene_id", "transcript_id(s)") %in% colnames(counts_raw)))
+gene_ids <- counts_raw$gene_id
+count_cols <- setdiff(colnames(counts_raw), c("gene_id", "transcript_id(s)"))
+counts <- as.matrix(counts_raw[, count_cols])
+rownames(counts) <- gene_ids
+
+coldata <- read.csv("data/experiment_table.csv", stringsAsFactors = FALSE)
+
+cat(sprintf("Counts matrix: %d genes x %d samples\n", nrow(counts), ncol(counts)))
+knitr::kable(coldata, caption = "Sample sheet")
+```
+
+## 2. Round non-integer counts
+
+RSEM reports **expected counts** (fractional). DESeq2 requires integers, so we round.
+
+```{r round}
+#| label: round-counts
+frac_before <- mean(counts != round(counts))
+counts <- round(counts)
+mode(counts) <- "integer"
+cat(sprintf("Rounded to integers (%.1f%% of cells were non-integer before rounding).\n",
+            100 * frac_before))
+```
+
+## 3. Align samples to the sample sheet
+
+Order the count columns to match sample-sheet rows and assert they agree — mismatched
+columns would silently produce wrong results.
+
+```{r align}
+#| label: align-samples
+stopifnot(all(coldata$ID %in% colnames(counts)))
+counts <- counts[, coldata$ID]
+stopifnot(identical(colnames(counts), coldata$ID))
+cat("Count columns aligned to sample sheet.\n")
+```
+
+## 4. Factors & reference levels
+
+`Untreated` is set as the reference so log2FC = Dexamethasone vs Untreated.
+
+```{r factors}
+#| label: factors
+coldata$cellLine  <- factor(coldata$cellLine)
+coldata$treatment <- relevel(factor(coldata$treatment), ref = "Untreated")
+
+cat("treatment levels (first = reference):", paste(levels(coldata$treatment), collapse = ", "), "\n")
+cat("cellLine  levels:", paste(levels(coldata$cellLine), collapse = ", "), "\n")
+```
+
+## 5. Build the DESeqDataSet & pre-filter
+
+Paired/blocked design `~ cellLine + treatment`. We drop genes with very low total
+counts (a large fraction are all-zero in this matrix).
+
+```{r build}
+#| label: build-dds
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+
+n_before <- nrow(dds)
+keep <- rowSums(counts(dds)) >= MIN_ROWSUM
+dds  <- dds[keep, ]
+cat(sprintf("Pre-filter (rowSums >= %d): kept %d of %d genes (%.1f%%).\n",
+            MIN_ROWSUM, nrow(dds), n_before, 100 * nrow(dds) / n_before))
+```
+
+## 6. Run DESeq2
+
+```{r run}
+#| label: run-deseq
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+## 7. QC: variance-stabilised PCA & sample distances
+
+We expect samples to **separate by treatment** and to **pair by cell line**.
+
+```{r vst}
+#| label: vst
+vsd <- vst(dds, blind = TRUE)
+```
+
+### PCA
+
+```{r pca}
+#| label: fig-pca
+#| fig-cap: "PCA on VST data. Colour = treatment, shape = donor cell line."
+pca <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+pv  <- round(100 * attr(pca, "percentVar"))
+
+p_pca <- ggplot(pca, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
+  geom_point(size = 4, alpha = 0.9) +
+  labs(x = sprintf("PC1 (%d%%)", pv[1]),
+       y = sprintf("PC2 (%d%%)", pv[2]),
+       title = "PCA — VST counts") +
+  scale_colour_brewer(palette = "Set1")
+ggsave(file.path(fig_dir, "pca.png"), p_pca, width = 7, height = 5, dpi = 150)
+p_pca
+```
+
+*Interpretation:* the dominant axis separating treated from untreated samples reflects
+the dexamethasone response; consistent pairing by cell line motivates blocking on
+`cellLine`.
+
+### Sample-distance heatmap
+
+```{r distheat}
+#| label: fig-distheat
+#| fig-cap: "Euclidean distances between samples on VST data."
+sampleDists <- dist(t(assay(vsd)))
+distMat <- as.matrix(sampleDists)
+labs <- with(coldata, paste(treatment, cellLine, sep = " | "))
+rownames(distMat) <- labs; colnames(distMat) <- labs
+cols <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+png(file.path(fig_dir, "sample_distances.png"), width = 7, height = 6, units = "in", res = 150)
+pheatmap(distMat, clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists, col = cols,
+         main = "Sample-to-sample distances")
+dev.off()
+pheatmap(distMat, clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists, col = cols,
+         main = "Sample-to-sample distances")
+```
+
+## 8. Results table
+
+Extract the treatment contrast at FDR < `r ALPHA`, then apply `apeglm` LFC shrinkage
+for ranking and plots.
+
+```{r results}
+#| label: deseq-results
+res <- results(dds, name = "treatment_Dexamethasone_vs_Untreated",
+               alpha = ALPHA)
+
+res_shrunk <- lfcShrink(dds, coef = "treatment_Dexamethasone_vs_Untreated",
+                        type = "apeglm", res = res)
+
+summary(res)
+
+n_sig  <- sum(res$padj < ALPHA, na.rm = TRUE)
+n_up   <- sum(res$padj < ALPHA & res$log2FoldChange > 0, na.rm = TRUE)
+n_down <- sum(res$padj < ALPHA & res$log2FoldChange < 0, na.rm = TRUE)
+cat(sprintf("At FDR < %.2f: %d DE genes (%d up with dex, %d down).\n",
+            ALPHA, n_sig, n_up, n_down))
+```
+
+## 9. Annotate with gene symbols
+
+Map Ensembl gene IDs to HGNC symbols (`org.Hs.eg.db`).
+
+```{r annotate}
+#| label: annotate
+res_df <- as.data.frame(res_shrunk)
+res_df$gene_id <- rownames(res_df)
+
+# Ensembl IDs here have no version suffix; map directly.
+res_df$symbol <- mapIds(org.Hs.eg.db, keys = res_df$gene_id,
+                        column = "SYMBOL", keytype = "ENSEMBL",
+                        multiVals = "first")
+
+res_df <- res_df[order(res_df$padj), ]
+res_df <- res_df[, c("gene_id", "symbol", "baseMean", "log2FoldChange",
+                     "lfcSE", "pvalue", "padj")]
+knitr::kable(head(res_df, 15), digits = 3,
+             caption = "Top 15 genes by adjusted p-value (shrunk log2FC)")
+```
+
+## 10. Figures
+
+### MA plot
+
+```{r ma}
+#| label: fig-ma
+#| fig-cap: "MA plot (apeglm-shrunk log2 fold changes). Red = FDR < alpha."
+png(file.path(fig_dir, "ma_plot.png"), width = 7, height = 5, units = "in", res = 150)
+plotMA(res_shrunk, alpha = ALPHA, main = "MA plot (shrunk LFC)")
+dev.off()
+plotMA(res_shrunk, alpha = ALPHA, main = "MA plot (shrunk LFC)")
+```
+
+### Volcano plot
+
+```{r volcano}
+#| label: fig-volcano
+#| fig-cap: "Volcano plot. Labelled: top genes by adjusted p-value."
+vol <- res_df
+vol$sig <- with(vol, ifelse(!is.na(padj) & padj < ALPHA,
+                            ifelse(log2FoldChange > 0, "Up", "Down"), "n.s."))
+vol$neglog10p <- -log10(vol$pvalue)
+top_lab <- head(vol[!is.na(vol$padj), ], 15)
+
+p_vol <- ggplot(vol, aes(log2FoldChange, neglog10p, colour = sig)) +
+  geom_point(alpha = 0.6, size = 1.4) +
+  scale_colour_manual(values = c(Up = "#E41A1C", Down = "#377EB8", `n.s.` = "grey70")) +
+  geom_text_repel(data = top_lab,
+                  aes(label = ifelse(is.na(symbol), gene_id, symbol)),
+                  size = 3, max.overlaps = 20, colour = "black") +
+  labs(x = "log2 fold change (Dex vs Untreated)", y = "-log10 p-value",
+       colour = NULL, title = "Volcano — Dexamethasone vs Untreated")
+ggsave(file.path(fig_dir, "volcano.png"), p_vol, width = 7, height = 6, dpi = 150)
+p_vol
+```
+
+### Heatmap of top DE genes
+
+```{r topheat}
+#| label: fig-topheat
+#| fig-cap: "Top DE genes (VST, row z-scored)."
+top_genes <- head(res_df$gene_id[!is.na(res_df$padj)], N_TOP_HEATMAP)
+mat <- assay(vsd)[top_genes, ]
+mat <- t(scale(t(mat)))  # z-score per gene
+
+lab_symbol <- res_df$symbol[match(top_genes, res_df$gene_id)]
+rownames(mat) <- ifelse(is.na(lab_symbol), top_genes, lab_symbol)
+colnames(mat) <- with(coldata, paste(treatment, cellLine, sep = " | "))
+
+ann_col <- data.frame(treatment = coldata$treatment, cellLine = coldata$cellLine)
+rownames(ann_col) <- colnames(mat)
+
+png(file.path(fig_dir, "top_de_heatmap.png"), width = 8, height = 9, units = "in", res = 150)
+pheatmap(mat, annotation_col = ann_col, show_colnames = TRUE,
+         main = sprintf("Top %d DE genes (z-scored VST)", length(top_genes)))
+dev.off()
+pheatmap(mat, annotation_col = ann_col, show_colnames = TRUE,
+         main = sprintf("Top %d DE genes (z-scored VST)", length(top_genes)))
+```
+
+*Interpretation:* rows cluster into dexamethasone-induced vs -repressed genes, with
+columns grouping by treatment across all four donors — the hallmark of a consistent,
+donor-independent glucocorticoid response.
+
+## 11. Export
+
+```{r export}
+#| label: export
+out_csv <- file.path("results", "deseq2_results.csv")
+write.csv(res_df, out_csv, row.names = FALSE)
+cat("Wrote:\n  ", out_csv, "\n  ",
+    paste(file.path(fig_dir, c("pca.png", "sample_distances.png", "ma_plot.png",
+                               "volcano.png", "top_de_heatmap.png")),
+          collapse = "\n   "), "\n")
+```
+
+## 12. Reproducibility
+
+```{r sessioninfo}
+#| label: sessioninfo
+sessionInfo()
+```

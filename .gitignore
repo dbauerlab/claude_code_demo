@@ -1,0 +1,9 @@
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# Rendered Quarto output
+/analysis.html
+/analysis_files/
+
+# Generated analysis outputs
+/results/

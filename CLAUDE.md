@@ -12,7 +12,7 @@ All data lives in `data/`:
 
 - **`experiment_table.csv`** — sample metadata. Columns: `ID` (SRR accession), `cellLine` (4 human airway smooth muscle cell lines: N61311, N052611, N080611, N061011), `treatment` (Untreated or Dexamethasone). 8 samples total: one untreated/treated pair per cell line.
 
-- **`rsem.merged.gene_counts.tsv`** — RSEM gene-level count matrix. Rows are genes (~58,735 Ensembl gene IDs), columns are `gene_id`, `transcript_id(s)`, then one column per SRR sample. Values are raw counts (floats from RSEM). Sample column order matches the `ID` column in `experiment_table.csv`.
+- **`rsem.merged.gene_counts.tsv`** — RSEM gene-level count matrix. Rows are genes (~58,735 Ensembl gene IDs), columns are `gene_id`, `transcript_id(s)`, then one column per SRR sample. Values are raw counts as floats from RSEM; round them to integers before use (e.g. DESeq2 requires integer counts). Sample column order matches the `ID` column in `experiment_table.csv`.
 
 ## Dataset context
 

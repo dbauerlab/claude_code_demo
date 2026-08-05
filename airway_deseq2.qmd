@@ -1,0 +1,692 @@
+---
+title: "Dexamethasone response in airway smooth muscle"
+subtitle: "Bulk RNA-seq differential expression with DESeq2, paired design `~ cellLine + treatment`"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 7
+    fig-height: 5
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+    dev: ["png", "pdf"]
+    fig.path: "figures/"
+    dpi: 150
+---
+
+## Overview
+
+This document runs the complete differential expression workflow for the **airway** dataset
+(Himes et al. — human airway smooth muscle cells treated with dexamethasone) end to end:
+input validation, count preparation, quality control, model fitting, and results export.
+
+The experiment is a **paired design**. Four cell lines each contribute one `Untreated` and one
+`Dexamethasone` sample, so cell line is a nuisance factor and not a replicate group. The model
+blocks on it (`~ cellLine + treatment`, with `treatment` last so it is the coefficient of
+interest). A diagnostic section near the end quantifies what an unpaired 4-vs-4 comparison would
+cost, which is the single most likely way to get this analysis wrong.
+
+Every consistency check in this document is a hard `stopifnot()` assertion rather than a printed
+note. If an input file changes shape, a sample is mismatched, or the reference level flips, the
+render fails loudly instead of producing plausible but wrong numbers.
+
+```{r}
+#| label: setup
+set.seed(20260805)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+
+theme_set(theme_bw(base_size = 12))
+
+# Diagnostics are printed with cat()/print() rather than message() so they always
+# appear in the rendered document, independent of the chunk's message setting.
+cat("DESeq2 version:", as.character(packageVersion("DESeq2")), "\n")
+```
+
+## Load and validate the inputs
+
+`check.names = FALSE` is essential: it preserves the `transcript_id(s)` header, which contains
+parentheses, and the sample names, instead of mangling them into `transcript_id.s.`. The counts
+file has Windows line endings, which R handles transparently.
+
+```{r}
+#| label: load-inputs
+coldata <- read.csv("data/experiment_table.csv", stringsAsFactors = FALSE)
+raw     <- read.delim("data/rsem.merged.gene_counts.tsv", check.names = FALSE)
+
+cat("sample sheet:  ", nrow(coldata), "rows x", ncol(coldata), "columns\n")
+cat("counts file:   ", nrow(raw), "rows x", ncol(raw), "columns\n")
+cat("counts columns:", paste(names(raw), collapse = ", "), "\n")
+```
+
+### Build the count matrix, matching samples by name
+
+The first two columns are identifiers, not samples, and must be removed before a numeric matrix
+can be built. The sample columns happen to be in the same order as the sample sheet rows, but
+the matrix is reordered **by name** anyway — that is what keeps this document correct if the
+counts file is ever regenerated with its columns in a different order. A silent mismatch here
+would produce results that look entirely reasonable and are wrong.
+
+```{r}
+#| label: build-matrix
+id_cols <- c("gene_id", "transcript_id(s)")
+stopifnot(all(id_cols %in% names(raw)))
+stopifnot(!anyDuplicated(raw$gene_id))
+
+counts_df <- raw[, setdiff(names(raw), id_cols), drop = FALSE]
+rownames(counts_df) <- raw$gene_id
+
+# Fail rather than guess if the sample sets differ at all.
+stopifnot(setequal(colnames(counts_df), coldata$ID))
+
+counts_df <- counts_df[, coldata$ID, drop = FALSE]
+stopifnot(identical(colnames(counts_df), coldata$ID))
+
+# DESeq2 matches colData to countData by row name, so set them explicitly.
+rownames(coldata) <- coldata$ID
+
+cat("sample columns aligned to the sample sheet by name:",
+    identical(colnames(counts_df), coldata$ID), "\n")
+cat("samples:", ncol(counts_df), "\n")
+```
+
+### The design, made visible
+
+Every cell of this cross-tab should contain exactly `1`. That is the paired design: each cell
+line contributes one matched pair, so there are no within-group replicates to average over —
+the treatment effect is estimated *within* cell line.
+
+```{r}
+#| label: design-table
+design_tab <- table(cellLine = coldata$cellLine, treatment = coldata$treatment)
+knitr::kable(design_tab, caption = "Samples per cell line and treatment.")
+
+stopifnot(all(design_tab == 1))
+cat("balanced paired design confirmed:", nrow(design_tab), "cell lines x",
+    ncol(design_tab), "treatments, one sample each\n")
+```
+
+## Prepare counts for DESeq2
+
+### Rounding
+
+RSEM reports *expected* counts, which are fractional (e.g. `284.50`). DESeq2 requires integers
+and refuses fractional input. The matrix is therefore rounded with `round()` — **not**
+`as.integer()`, which truncates toward zero and would systematically bias every fractional
+count downward. DESeq2 converts the rounded whole numbers to integer storage itself.
+
+The usual route for RSEM output is `tximport`, which does not apply here: this file is already
+merged to gene level by the nf-core/rnaseq pipeline.
+
+```{r}
+#| label: round-counts
+counts_num <- as.matrix(counts_df)
+
+n_nonint <- sum(apply(counts_num, 1, function(x) any(x != round(x))))
+cat("gene rows containing at least one non-integer expected count:", n_nonint, "\n")
+
+counts <- round(counts_num)
+stopifnot(all(counts == round(counts)), !anyNA(counts))
+```
+
+### Factor levels and the reference
+
+R orders factor levels alphabetically, which would make `Dexamethasone` the reference and
+silently flip the sign of every log2 fold change. The reference is set explicitly, and asserted.
+
+**With `Untreated` as the reference, a positive log2 fold change means the gene is induced by
+dexamethasone.**
+
+```{r}
+#| label: factors
+coldata$treatment <- relevel(factor(coldata$treatment), ref = "Untreated")
+coldata$cellLine  <- factor(coldata$cellLine)
+
+stopifnot(levels(coldata$treatment)[1] == "Untreated")
+
+cat("treatment levels (reference first):",
+    paste(levels(coldata$treatment), collapse = " -> "), "\n")
+cat("cellLine levels:", paste(levels(coldata$cellLine), collapse = ", "), "\n")
+```
+
+### Build the object and pre-filter
+
+The file is the full Ensembl annotation, so roughly half of it is zero in every sample.
+Pre-filtering removes rows that cannot contribute evidence, which speeds up fitting and
+improves the multiple-testing correction by shrinking the number of tests.
+
+```{r}
+#| label: build-dds
+dds_all <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+
+n_before  <- nrow(dds_all)
+n_allzero <- sum(rowSums(counts(dds_all)) == 0)
+
+keep <- rowSums(counts(dds_all)) >= 10
+dds  <- dds_all[keep, ]
+
+cat(sprintf("genes: %d in file -> %d retained (%.1f%%)\n",
+            n_before, nrow(dds), 100 * nrow(dds) / n_before))
+cat(sprintf("all-zero across all samples: %d (%.1f%%)\n",
+            n_allzero, 100 * n_allzero / n_before))
+
+# A parsing or filtering regression would show up immediately as a collapsed gene count.
+stopifnot(nrow(dds) > 15000, ncol(dds) == nrow(coldata))
+```
+
+### Gene symbols (optional)
+
+Gene IDs are unversioned Ensembl (`ENSG00000000003`), so they map directly with no `.N` suffix
+to strip. Symbols make the tables and figures readable, but the mapping is optional: if
+`org.Hs.eg.db` is not installed the document still renders, labelling everything with Ensembl
+IDs instead. Unmapped IDs — common for non-coding entries — keep their Ensembl ID as the label.
+The `gene_id` column is never replaced, only supplemented with `symbol`.
+
+```{r}
+#| label: annotate
+have_org <- requireNamespace("org.Hs.eg.db", quietly = TRUE) &&
+            requireNamespace("AnnotationDbi", quietly = TRUE)
+
+gene_map <- if (have_org) {
+  suppressMessages(AnnotationDbi::mapIds(
+    org.Hs.eg.db::org.Hs.eg.db,
+    keys      = rownames(dds),
+    column    = "SYMBOL",
+    keytype   = "ENSEMBL",
+    multiVals = "first"
+  ))
+} else {
+  setNames(rep(NA_character_, nrow(dds)), rownames(dds))
+}
+
+# Label with the symbol when there is one, otherwise fall back to the Ensembl ID.
+gene_label <- function(ids) {
+  s <- unname(gene_map[ids])
+  ifelse(is.na(s) | s == "", ids, s)
+}
+symbol_of <- function(ids) unname(gene_map[ids])
+
+# Reverse lookup, used only for the marker-gene positive control below.
+id_for_symbol <- function(sym) {
+  hits <- names(gene_map)[!is.na(gene_map) & gene_map == sym]
+  if (length(hits) == 0) NA_character_ else hits[1]
+}
+
+if (have_org) {
+  cat(sprintf("symbol mapping: %d of %d filtered genes mapped (%.1f%%)\n",
+              sum(!is.na(gene_map)), length(gene_map),
+              100 * mean(!is.na(gene_map))))
+} else {
+  cat("org.Hs.eg.db not installed - labelling with Ensembl IDs only.\n")
+  cat("Install it with: BiocManager::install('org.Hs.eg.db')\n")
+}
+```
+
+## Quality control
+
+### Library sizes
+
+Library sizes span roughly a two-fold range, which is exactly why comparisons must be made on
+size-factor-normalised data rather than raw counts.
+
+```{r}
+#| label: fig-library-sizes
+#| fig-cap: "Total expected counts per sample, after filtering."
+lib <- data.frame(
+  sample    = colnames(dds),
+  total     = colSums(counts(dds)),
+  cellLine  = dds$cellLine,
+  treatment = dds$treatment
+)
+
+ggplot(lib, aes(x = reorder(sample, total), y = total / 1e6, fill = treatment)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Total counts (millions)", fill = "Treatment",
+       title = "Library sizes") +
+  scale_fill_brewer(palette = "Set2")
+
+cat(sprintf("library sizes: %.1fM - %.1fM (%.2f-fold spread)\n",
+            min(lib$total) / 1e6, max(lib$total) / 1e6,
+            max(lib$total) / min(lib$total)))
+```
+
+### Variance-stabilising transform
+
+`vst()` is used for visualisation and clustering only — the differential test itself runs on raw
+counts. `blind = FALSE` lets the design inform the dispersion trend used by the transform, which
+is the right choice for QC of an experiment whose design is already known.
+
+```{r}
+#| label: vst
+vsd <- vst(dds, blind = FALSE)
+cat("VST matrix:", nrow(vsd), "genes x", ncol(vsd), "samples\n")
+```
+
+### PCA
+
+This is the visual argument for the blocked design. Expect the dominant component to separate
+**cell lines**, with the treatment shift appearing as a small, consistent displacement *within*
+each pair. The dashed lines connect the two samples of each cell line: if those connectors are
+roughly parallel, the treatment effect is consistent across cell lines and blocking on cell
+line will recover it.
+
+```{r}
+#| label: fig-pca
+#| fig-cap: "PCA of VST-transformed counts. Dashed lines connect the paired samples of each cell line."
+pca_data <- plotPCA(vsd, intgroup = c("cellLine", "treatment"), returnData = TRUE)
+pct <- round(100 * attr(pca_data, "percentVar"))
+
+ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_line(aes(group = cellLine), colour = "grey60", linetype = 2) +
+  geom_point(aes(colour = treatment, shape = cellLine), size = 4) +
+  labs(x = paste0("PC1: ", pct[1], "% variance"),
+       y = paste0("PC2: ", pct[2], "% variance"),
+       colour = "Treatment", shape = "Cell line",
+       title = "Samples cluster by cell line; treatment shifts within pairs") +
+  scale_colour_brewer(palette = "Set1") +
+  coord_fixed()
+```
+
+### Sample-to-sample distances
+
+Same-cell-line pairs should be each other's nearest neighbours — another view of the same fact.
+
+```{r}
+#| label: fig-sample-distances
+#| fig-cap: "Euclidean distances between samples on VST-transformed counts."
+#| fig-height: 5.5
+sample_dists <- dist(t(assay(vsd)))
+dist_mat <- as.matrix(sample_dists)
+
+sample_labels <- paste(vsd$cellLine, vsd$treatment, sep = " / ")
+rownames(dist_mat) <- sample_labels
+colnames(dist_mat) <- sample_labels
+
+pheatmap(
+  dist_mat,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  col  = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+  main = "Sample distances (VST)"
+)
+```
+
+## Fit the model
+
+```{r}
+#| label: fit
+dds <- DESeq(dds)
+print(resultsNames(dds))
+```
+
+The dispersion plot is the standard check that the fit is sane: per-gene estimates scattered
+around a decreasing trend, with final values shrunk toward it.
+
+```{r}
+#| label: fig-dispersion
+#| fig-cap: "Dispersion estimates: per-gene (black), fitted trend (red), shrunken final (blue)."
+plotDispEsts(dds, main = "Dispersion estimates")
+```
+
+### Extract the contrast
+
+The coefficient name is asserted before use, so the wrong contrast cannot be extracted quietly.
+
+Two result objects are produced deliberately:
+
+- **`res`** — unshrunken. Supplies the test statistics, p-values and adjusted p-values.
+- **`resLFC`** — shrunken fold changes. Supplies the effect sizes used for ranking and plotting.
+
+Shrinkage pulls in the wildly overstated fold changes that low-count genes produce, without
+touching the p-values. Mixing the two up — for example filtering on shrunken effect sizes while
+quoting unshrunken ones — is a common error, so both are carried side by side in the exported
+table with explicit column names.
+
+```{r}
+#| label: results
+coef_name <- "treatment_Dexamethasone_vs_Untreated"
+stopifnot(coef_name %in% resultsNames(dds))
+
+res <- results(dds, name = coef_name, alpha = 0.05)
+summary(res)
+
+# apeglm is the preferred shrinkage estimator; fall back to DESeq2's built-in
+# "normal" so a missing optional package cannot break the render.
+shrink_type <- if (requireNamespace("apeglm", quietly = TRUE)) "apeglm" else "normal"
+cat("LFC shrinkage estimator:", shrink_type, "\n")
+
+resLFC <- lfcShrink(dds, coef = coef_name, type = shrink_type)
+```
+
+```{r}
+#| label: results-table
+res_df <- as.data.frame(res)
+res_df$gene_id <- rownames(res_df)
+
+lfc_df <- as.data.frame(resLFC)
+stopifnot(setequal(rownames(lfc_df), res_df$gene_id))
+
+res_df$symbol                <- symbol_of(res_df$gene_id)
+res_df$log2FoldChange_shrunk <- lfc_df[res_df$gene_id, "log2FoldChange"]
+res_df$lfcSE_shrunk          <- lfc_df[res_df$gene_id, "lfcSE"]
+
+res_df <- res_df[, c("gene_id", "symbol", "baseMean",
+                     "log2FoldChange", "lfcSE",
+                     "log2FoldChange_shrunk", "lfcSE_shrunk",
+                     "stat", "pvalue", "padj")]
+res_df <- res_df[order(res_df$padj, -abs(res_df$log2FoldChange_shrunk)), ]
+
+n_tested <- sum(!is.na(res_df$padj))
+n_sig    <- sum(res_df$padj < 0.05, na.rm = TRUE)
+n_up     <- sum(res_df$padj < 0.05 & res_df$log2FoldChange_shrunk > 0, na.rm = TRUE)
+n_down   <- sum(res_df$padj < 0.05 & res_df$log2FoldChange_shrunk < 0, na.rm = TRUE)
+n_strong <- sum(res_df$padj < 0.05 & abs(res_df$log2FoldChange_shrunk) > 1, na.rm = TRUE)
+
+cat(sprintf("genes tested (padj not NA): %d\n", n_tested))
+cat(sprintf("padj < 0.05:                %d  (%d up, %d down)\n", n_sig, n_up, n_down))
+cat(sprintf("padj < 0.05 & |LFC| > 1:    %d\n", n_strong))
+```
+
+### Top differentially expressed genes
+
+```{r}
+#| label: top-genes-table
+top_tab <- head(res_df, 20)
+top_tab$gene <- gene_label(top_tab$gene_id)
+knitr::kable(
+  top_tab[, c("gene", "gene_id", "baseMean", "log2FoldChange_shrunk", "pvalue", "padj")],
+  digits = c(0, 0, 1, 3, 30, 30), row.names = FALSE,
+  caption = "Top 20 genes by adjusted p-value. Positive log2FC = induced by dexamethasone."
+)
+```
+
+## Figures
+
+### MA plots
+
+Shrunken and unshrunken side by side. The difference is concentrated at the low-expression left
+edge, where the unshrunken estimates fan out into noise.
+
+```{r}
+#| label: fig-ma-plots
+#| fig-cap: "MA plots. Left: shrunken fold changes. Right: unshrunken."
+#| fig-width: 10
+#| fig-height: 4.5
+op <- par(mfrow = c(1, 2))
+plotMA(resLFC, ylim = c(-5, 5), main = paste0("Shrunken (", shrink_type, ")"))
+plotMA(res,    ylim = c(-5, 5), main = "Unshrunken")
+par(op)
+```
+
+### Volcano
+
+```{r}
+#| label: fig-volcano
+#| fig-cap: "Volcano plot using shrunken fold changes. Dashed lines mark padj = 0.05 and |log2FC| = 1."
+#| fig-height: 6
+vol <- res_df[!is.na(res_df$padj), ]
+vol$category <- with(vol, ifelse(
+  padj < 0.05 & abs(log2FoldChange_shrunk) > 1, "padj<0.05 & |LFC|>1",
+  ifelse(padj < 0.05, "padj<0.05", "not significant")
+))
+vol$category <- factor(vol$category,
+  levels = c("not significant", "padj<0.05", "padj<0.05 & |LFC|>1"))
+vol$label <- gene_label(vol$gene_id)
+
+top_lab <- head(vol[order(vol$padj), ], 15)
+
+p_vol <- ggplot(vol, aes(x = log2FoldChange_shrunk, y = -log10(padj))) +
+  geom_point(aes(colour = category), alpha = 0.6, size = 1.2) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, colour = "grey40") +
+  geom_vline(xintercept = c(-1, 1),     linetype = 2, colour = "grey40") +
+  scale_colour_manual(values = c("not significant"      = "grey70",
+                                 "padj<0.05"            = "#3182bd",
+                                 "padj<0.05 & |LFC|>1"  = "#e6550d")) +
+  labs(x = "log2 fold change (Dexamethasone vs Untreated, shrunken)",
+       y = "-log10 adjusted p-value", colour = NULL,
+       title = "Dexamethasone response") +
+  theme(legend.position = "top")
+
+if (requireNamespace("ggrepel", quietly = TRUE)) {
+  p_vol <- p_vol + ggrepel::geom_text_repel(
+    data = top_lab, aes(label = label),
+    size = 3, max.overlaps = 20, min.segment.length = 0, show.legend = FALSE
+  )
+} else {
+  p_vol <- p_vol + geom_text(
+    data = top_lab, aes(label = label),
+    size = 3, vjust = -0.7, check_overlap = TRUE, show.legend = FALSE
+  )
+}
+p_vol
+```
+
+### p-value distribution
+
+A well-behaved test gives a flat null with a spike near zero. A different shape (a slope, or a
+spike at 1) points at an unmodelled batch effect or a mis-specified design.
+
+```{r}
+#| label: fig-pvalue-hist
+#| fig-cap: "Raw p-value distribution for genes with a non-NA p-value."
+#| fig-height: 4
+ggplot(res_df[!is.na(res_df$pvalue), ], aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.02, fill = "#3182bd", colour = "white") +
+  labs(x = "raw p-value", y = "genes", title = "p-value distribution")
+```
+
+### Top-gene heatmap
+
+Row-centred VST values, so the colour shows each gene's deviation from its own mean. Because
+samples are ordered with the annotation bars visible, the paired structure is readable directly:
+the treatment split should hold within each cell line.
+
+```{r}
+#| label: fig-top-genes-heatmap
+#| fig-cap: "Top 40 genes by adjusted p-value, VST values centred per gene."
+#| fig-height: 8
+top40 <- head(res_df$gene_id[!is.na(res_df$padj)], 40)
+
+mat <- assay(vsd)[top40, , drop = FALSE]
+mat <- mat - rowMeans(mat)
+rownames(mat) <- make.unique(gene_label(top40))
+
+ann_col <- data.frame(
+  treatment = dds$treatment,
+  cellLine  = dds$cellLine,
+  row.names = paste(dds$cellLine, dds$treatment, sep = " / ")
+)
+colnames(mat) <- rownames(ann_col)
+
+pheatmap(
+  mat,
+  annotation_col = ann_col,
+  col = colorRampPalette(rev(brewer.pal(11, "RdBu")))(255),
+  cluster_cols = TRUE, show_colnames = TRUE, fontsize_row = 8,
+  main = "Top 40 DE genes (centred VST)"
+)
+```
+
+### Marker genes: biological positive control
+
+A handful of genes are well-established dexamethasone responders in airway smooth muscle. If the
+analysis is correct these should show a clear, consistent shift, and it should be in the same
+direction in all four cell lines. Genes are looked up **by symbol** through the annotation map
+rather than by hardcoded Ensembl IDs; anything that fails to resolve or was removed by filtering
+is reported and skipped rather than raising an error.
+
+```{r}
+#| label: fig-marker-genes
+#| fig-cap: "Normalised counts for known dexamethasone-responsive genes. Lines connect paired samples."
+#| fig-height: 6
+markers <- c("CRISPLD2", "DUSP1", "PER1", "KLF15", "FKBP5", "ZBTB16", "SPARCL1")
+
+if (!have_org) {
+  cat("Annotation package unavailable - marker-gene control skipped.\n")
+} else {
+  marker_ids <- vapply(markers, id_for_symbol, character(1))
+  usable     <- !is.na(marker_ids) & marker_ids %in% rownames(dds)
+
+  if (any(!usable)) {
+    cat("skipped (symbol unresolved or gene filtered out):",
+        paste(markers[!usable], collapse = ", "), "\n")
+  }
+
+  if (!any(usable)) {
+    cat("No marker genes available to plot.\n")
+  } else {
+    marker_counts <- do.call(rbind, lapply(markers[usable], function(sym) {
+      d <- plotCounts(dds, gene = marker_ids[[sym]],
+                      intgroup = c("cellLine", "treatment"),
+                      returnData = TRUE, normalized = TRUE)
+      d$symbol <- sym
+      d
+    }))
+
+    print(
+      ggplot(marker_counts, aes(x = treatment, y = count)) +
+        geom_line(aes(group = cellLine), colour = "grey65", linetype = 2) +
+        geom_point(aes(colour = cellLine), size = 2.5) +
+        facet_wrap(~ symbol, scales = "free_y") +
+        scale_y_log10() +
+        labs(x = NULL, y = "normalised count (log10)", colour = "Cell line",
+             title = "Known dexamethasone responders")
+    )
+
+    marker_stats <- res_df[res_df$gene_id %in% marker_ids[usable], ]
+    marker_stats$gene <- gene_label(marker_stats$gene_id)
+    knitr::kable(
+      marker_stats[, c("gene", "gene_id", "baseMean",
+                       "log2FoldChange_shrunk", "padj")],
+      digits = c(0, 0, 1, 3, 30), row.names = FALSE,
+      caption = "Marker gene statistics. Positive log2FC = induced by dexamethasone."
+    )
+  }
+}
+```
+
+## Export results
+
+```{r}
+#| label: write-outputs
+sig_df <- res_df[!is.na(res_df$padj) & res_df$padj < 0.05, ]
+
+norm_counts <- counts(dds, normalized = TRUE)
+norm_out <- data.frame(gene_id = rownames(norm_counts),
+                       symbol  = symbol_of(rownames(norm_counts)),
+                       norm_counts, check.names = FALSE)
+
+vst_mat <- assay(vsd)
+vst_out <- data.frame(gene_id = rownames(vst_mat),
+                      symbol  = symbol_of(rownames(vst_mat)),
+                      vst_mat, check.names = FALSE)
+
+sf_out <- data.frame(sample       = names(sizeFactors(dds)),
+                     size_factor  = as.numeric(sizeFactors(dds)),
+                     library_size = colSums(counts(dds)),
+                     cellLine     = as.character(dds$cellLine),
+                     treatment    = as.character(dds$treatment))
+
+write_tsv <- function(x, file) {
+  write.table(x, file.path("results", file),
+              sep = "\t", quote = FALSE, row.names = FALSE, na = "NA")
+  cat(sprintf("  results/%-32s %6d rows\n", file, nrow(x)))
+}
+
+cat("written:\n")
+write_tsv(res_df,      "de_results_all.tsv")
+write_tsv(sig_df,      "de_results_significant.tsv")
+write_tsv(norm_out,    "normalized_counts.tsv")
+write_tsv(vst_out,     "vst_counts.tsv")
+write_tsv(sf_out,      "size_factors.tsv")
+```
+
+## Diagnostic: what an unpaired analysis would cost
+
+CLAUDE.md flags the unpaired 4-vs-4 comparison as the most likely mistake for this dataset. This
+section makes the cost concrete by refitting the *same filtered counts* with `~ treatment`
+alone, discarding the pairing.
+
+This is a diagnostic only. **The blocked model above is the result**; the unpaired fit is shown
+to justify why `cellLine` is in the formula.
+
+```{r}
+#| label: unpaired-fit
+# Rebuilt from scratch rather than re-assigning design() on the fitted object,
+# which would leave stale estimates attached.
+dds_unpaired <- DESeqDataSetFromMatrix(
+  countData = counts(dds),
+  colData   = coldata,
+  design    = ~ treatment
+)
+dds_unpaired <- DESeq(dds_unpaired)
+stopifnot(coef_name %in% resultsNames(dds_unpaired))
+
+res_unpaired <- results(dds_unpaired, name = coef_name, alpha = 0.05)
+
+n_sig_unpaired <- sum(res_unpaired$padj < 0.05, na.rm = TRUE)
+
+comparison <- data.frame(
+  model            = c("~ cellLine + treatment (paired)", "~ treatment (unpaired)"),
+  significant_genes = c(n_sig, n_sig_unpaired)
+)
+knitr::kable(comparison, caption = "Genes at padj < 0.05 under each model.")
+
+cat(sprintf("the unpaired model recovers %d of %d genes (%.0f%%)\n",
+            n_sig_unpaired, n_sig, 100 * n_sig_unpaired / max(n_sig, 1)))
+```
+
+```{r}
+#| label: fig-paired-vs-unpaired
+#| fig-cap: "Evidence per gene under both models. Points above the diagonal gain power from blocking on cell line."
+#| fig-height: 5.5
+cmp <- data.frame(
+  gene_id  = rownames(res_unpaired),
+  unpaired = -log10(res_unpaired$padj),
+  paired   = -log10(res$padj[match(rownames(res_unpaired), rownames(res))])
+)
+cmp <- cmp[is.finite(cmp$paired) & is.finite(cmp$unpaired), ]
+
+ggplot(cmp, aes(x = unpaired, y = paired)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_abline(slope = 1, intercept = 0, colour = "#e6550d") +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, colour = "grey40") +
+  geom_vline(xintercept = -log10(0.05), linetype = 2, colour = "grey40") +
+  labs(x = "-log10 padj, unpaired (~ treatment)",
+       y = "-log10 padj, paired (~ cellLine + treatment)",
+       title = "Blocking on cell line recovers evidence the unpaired model loses")
+```
+
+Cell line is the largest source of variance in this experiment, as the PCA showed. The unpaired
+model leaves that variance in the residual, inflating the dispersion estimate for every gene and
+weakening every test. Blocking on cell line moves it into the model, where it belongs.
+
+## Reproducibility
+
+```{r}
+#| label: session-info
+cat("results/\n"); print(list.files("results"))
+cat("\nfigures/\n"); print(list.files("figures"))
+cat("\n")
+sessionInfo()
+```

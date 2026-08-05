@@ -6,6 +6,8 @@ results/
 *_files/
 /*.html
 analysis/*.html
+# ...but do track the rendered DE report (self-contained, figures embedded)
+!analysis/differential_expression.html
 
 # R session cruft
 .Rhistory

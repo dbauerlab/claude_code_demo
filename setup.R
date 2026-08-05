@@ -6,8 +6,12 @@
 # Expect ~10-20 minutes on a cold install. DESeq2 pulls a large dependency tree and
 # org.Hs.eg.db is a sizeable annotation database.
 
+# Set a CRAN mirror explicitly. Without this, a non-interactive `Rscript setup.R` can fail with
+# "trying to use CRAN without setting a mirror" when resolving CRAN dependencies.
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
 if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  install.packages("BiocManager")
 }
 
 needed <- c(
@@ -17,6 +21,8 @@ needed <- c(
   "org.Hs.eg.db",   # offline human Ensembl -> symbol annotation
   "AnnotationDbi",  # mapIds() interface to the above
   # CRAN
+  "knitr",          # Quarto's R engine -- required to execute the .qmd chunks
+  "rmarkdown",      # ditto; Quarto shells out to it for R rendering
   "ggplot2",
   "ggrepel",        # non-overlapping gene labels on the volcano plot
   "pheatmap",

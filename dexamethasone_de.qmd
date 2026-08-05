@@ -233,11 +233,12 @@ p_pca
 ggsave("results/figures/pca.png", p_pca, width = 7, height = 5, dpi = 150)
 ```
 
-The structure to look for is donor separation on one axis and treatment separation on another.
-Donor identity accounting for the larger share of variance than treatment is exactly why
-`cellLine` is in the model: left unmodelled, that variation would sit in the residuals and cost
-real power. Treated and untreated samples from the *same* donor should sit close together along
-the donor axis while separating along the treatment axis.
+Treatment is the dominant source of variation here: PC1 (42%) cleanly separates the four
+untreated samples on the left from the four treated samples on the right, and donor identity
+appears as the secondary PC2 (25%) spread within each treatment group. That donor spread on PC2
+is real structure, and leaving it unmodelled would push it into the residuals and cost power —
+which is exactly what the `cellLine` blocking term absorbs. So blocking on donor remains the
+right call even though, in this dataset, the treatment effect is the larger of the two.
 
 ### Sample-to-sample distances
 
@@ -271,8 +272,11 @@ pheatmap(
 )
 ```
 
-Samples from the same donor are expected to be each other's nearest neighbours, reinforcing the
-PCA reading: donor is the dominant source of variation and must be blocked.
+The dendrogram splits first into two clean blocks of four — all untreated on one side, all
+treated on the other — reinforcing the PCA reading that treatment is the primary axis. Within
+each block the donor pairing is only partial (N080611 is the one donor whose two samples sit
+closest together), so the paired structure is present but secondary. Blocking on `cellLine`
+still pays off by removing that residual donor variation from the treatment comparison.
 
 ## Differential expression
 
@@ -440,7 +444,10 @@ stopifnot(all(
 ```
 
 All three markers move in the expected direction, so a positive log2FC in this report means up in
-Dexamethasone relative to Untreated.
+Dexamethasone relative to Untreated. The check here is on the *sign*, not significance: `DUSP1`
+and `KLF15` are strongly induced with tiny adjusted *p*-values, while `CCL2` is repressed but sits
+just above the FDR threshold (padj ≈ 0.05) — a weak effect in this dataset, though clearly in the
+repressed direction.
 
 ## Figures
 
@@ -551,11 +558,12 @@ do.call(pheatmap, c(heatmap_args, list(
 )))
 ```
 
-Restricting to the top DE genes selects for treatment-driven signal, so columns are expected to
-split by treatment here even though the genome-wide QC plots above are dominated by donor. Check
-the two annotation tracks against the column dendrogram: a clean treatment split confirms the
-contrast, while any residual grouping by donor within each block is the paired structure that the
-`cellLine` term absorbs in the model.
+The columns split cleanly into an untreated block (left) and a treated block (right), matching
+the treatment annotation track. The block of genes in the lower two-thirds — including DUSP1,
+KLF15, SERPINA3, and SAMHD1 — is induced by dexamethasone, while the upper block (VCAM1, ADAM12,
+CXCL12) is repressed. The donor annotation track shows no consistent ordering within either
+block, consistent with the QC plots: treatment is the dominant signal and donor is the secondary
+structure the `cellLine` term absorbs.
 
 ## Exported files
 

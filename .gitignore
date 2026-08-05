@@ -1,0 +1,18 @@
+# Generated analysis output — reproducible by rendering the .qmd, so not tracked
+results/
+
+# Quarto / knitr render artefacts
+.quarto/
+*_files/
+/*.html
+analysis/*.html
+
+# R session cruft
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+
+# macOS
+.DS_Store

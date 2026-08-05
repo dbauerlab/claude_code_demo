@@ -1,0 +1,539 @@
+---
+title: "Dexamethasone response in airway smooth muscle cells"
+subtitle: "Bulk RNA-seq differential expression with DESeq2"
+author: "Tiphaine Cayol"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 7
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+Differential expression analysis of the *airway* dataset: 4 human airway smooth muscle
+cell lines, each with a paired untreated and dexamethasone-treated sample (Himes et al.
+2014, PMID 24926665).
+
+The design is **paired by donor cell line** — each line supplies its own control — so the
+model blocks on `cellLine` and tests `treatment`:
+
+$$\text{design} = \sim \text{cellLine} + \text{treatment}$$
+
+```{r}
+#| label: setup
+
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(ggrepel)
+library(RColorBrewer)
+
+set.seed(42)
+
+knitr::opts_chunk$set(dev = "png", dpi = 150)
+
+# Resolve the repo root whether this is rendered from the repo root or from analysis/.
+# Avoids a dependency on {here} while keeping paths correct either way.
+repo_root <- if (file.exists("data/experiment_table.csv")) "." else ".."
+stopifnot(file.exists(file.path(repo_root, "data", "experiment_table.csv")))
+
+fig_dir <- file.path(repo_root, "results", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+ALPHA <- 0.05  # FDR threshold, used consistently throughout
+```
+
+## Load inputs
+
+The count matrix carries a `transcript_id(s)` column alongside `gene_id`; both are dropped
+from the numeric matrix, with `gene_id` retained as rownames.
+
+```{r}
+#| label: load-data
+
+counts_raw <- read_tsv(
+  file.path(repo_root, "data", "rsem.merged.gene_counts.tsv"),
+  show_col_types = FALSE
+)
+
+coldata <- read_csv(
+  file.path(repo_root, "data", "experiment_table.csv"),
+  show_col_types = FALSE
+)
+
+gene_ids <- counts_raw$gene_id
+stopifnot(!anyDuplicated(gene_ids))  # rownames must be unique
+
+counts <- counts_raw |>
+  select(-gene_id, -`transcript_id(s)`) |>
+  as.matrix()
+rownames(counts) <- gene_ids
+
+cat(sprintf("Loaded %d genes x %d samples\n", nrow(counts), ncol(counts)))
+knitr::kable(coldata, caption = "Sample sheet")
+```
+
+## Round non-integer counts
+
+RSEM apportions multi-mapping reads probabilistically, so counts are **estimates, not
+integers** — `r format(sum(apply(counts, 1, function(x) any(x != floor(x)))), big.mark = ",")`
+genes carry fractional values here. DESeq2 requires integers and errors otherwise.
+
+`round()` is used deliberately rather than `floor()`, `trunc()`, or `as.integer()`: those
+truncate downward and would bias low-count genes toward zero.
+
+```{r}
+#| label: round-counts
+
+n_fractional <- sum(apply(counts, 1, function(x) any(x != floor(x))))
+zeros_before <- sum(rowSums(counts) == 0)
+
+counts <- round(counts)
+storage.mode(counts) <- "integer"  # DESeq2 wants an integer matrix
+
+zeros_after <- sum(rowSums(counts) == 0)
+
+cat(sprintf(
+  "Genes with fractional counts: %s\nAll-zero genes before rounding: %s\nAll-zero genes after rounding:  %s\n",
+  format(n_fractional, big.mark = ","),
+  format(zeros_before, big.mark = ","),
+  format(zeros_after, big.mark = ",")
+))
+```
+
+Note the all-zero count *rises* after rounding — genes whose every value sat below 0.5 collapse
+to zero. This is why filtering must happen **after** rounding, never before.
+
+## Align samples to the sample sheet
+
+Column order happens to match the sample sheet in this file, but relying on that is how
+silently-wrong results happen. Subset by name and assert.
+
+```{r}
+#| label: align-samples
+
+counts <- counts[, coldata$ID]
+stopifnot(identical(colnames(counts), coldata$ID))
+
+cat("Counts columns and sample sheet rows correspond by name.\n")
+```
+
+## Factors and reference level
+
+R orders factor levels alphabetically, which would make `Dexamethasone` the reference and
+**invert the sign of every log2 fold change**. Setting `Untreated` explicitly means a positive
+LFC reads as "induced by dexamethasone".
+
+```{r}
+#| label: factors
+
+# read_csv returns a tibble, which has no real rownames. DESeq2 matches colData rows to
+# count columns by rowname, and pheatmap needs them for annotations, so make it a
+# base data.frame keyed by sample ID.
+coldata <- as.data.frame(coldata)
+rownames(coldata) <- coldata$ID
+
+coldata$treatment <- relevel(factor(coldata$treatment), ref = "Untreated")
+coldata$cellLine  <- factor(coldata$cellLine)
+
+cat("treatment levels:", paste(levels(coldata$treatment), collapse = " -> "), "\n")
+cat("cellLine levels: ", paste(levels(coldata$cellLine), collapse = ", "), "\n")
+
+stopifnot(levels(coldata$treatment)[1] == "Untreated")
+```
+
+The first level printed above is the reference. `Untreated` must appear first.
+
+## Pre-filter low-count genes
+
+Nearly half of all genes are zero across every sample. Keeping genes with at least 10 counts
+in at least 4 samples (4 = the smallest group size) drops uninformative genes, which improves
+the dispersion fit and reduces the multiple-testing burden.
+
+```{r}
+#| label: prefilter
+
+n_before <- nrow(counts)
+keep <- rowSums(counts >= 10) >= 4
+counts <- counts[keep, ]
+
+cat(sprintf(
+  "Genes before filtering: %s\nGenes after filtering:  %s (%.1f%% retained)\n",
+  format(n_before, big.mark = ","),
+  format(nrow(counts), big.mark = ","),
+  100 * nrow(counts) / n_before
+))
+```
+
+## Build the DESeqDataSet and fit
+
+```{r}
+#| label: run-deseq
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+
+dds <- DESeq(dds)
+
+resultsNames(dds)
+```
+
+`treatment_Dexamethasone_vs_Untreated` is the coefficient of interest; the `cellLine_*` terms
+absorb donor-to-donor baseline differences and are not interpreted.
+
+## Quality control
+
+### Library sizes
+
+```{r}
+#| label: qc-libsize
+
+libsize <- tibble(
+  ID       = colnames(dds),
+  total    = colSums(counts(dds)),
+  treatment = colData(dds)$treatment,
+  cellLine  = colData(dds)$cellLine
+)
+
+p_lib <- ggplot(libsize, aes(x = ID, y = total / 1e6, fill = treatment)) +
+  geom_col() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Assigned reads (millions)", title = "Library sizes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_lib
+ggsave(file.path(fig_dir, "library_sizes.png"), p_lib, width = 7, height = 4.5, dpi = 150)
+```
+
+Library sizes span roughly a two-fold range, which is why raw counts are never compared
+directly — DESeq2's size factors handle this.
+
+### PCA
+
+Variance-stabilised counts, computed blind to the design so QC stays independent of the
+model being tested.
+
+```{r}
+#| label: qc-pca
+
+vsd <- vst(dds, blind = TRUE)
+
+pca_data <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+pct_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
+  geom_point(size = 4, alpha = 0.9) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    x = paste0("PC1: ", pct_var[1], "% variance"),
+    y = paste0("PC2: ", pct_var[2], "% variance"),
+    title = "PCA of variance-stabilised counts"
+  ) +
+  theme_minimal()
+
+p_pca
+ggsave(file.path(fig_dir, "pca.png"), p_pca, width = 7, height = 5, dpi = 150)
+```
+
+In a well-behaved paired design one axis separates treatment and another separates donor.
+Because donor differences are often the larger effect, treatment may well sit on PC2 rather
+than PC1 — that is expected here, not a problem, and is exactly what blocking on `cellLine`
+accounts for.
+
+### Sample-to-sample distances
+
+```{r}
+#| label: qc-distance
+#| fig-height: 5.5
+
+sample_dists <- dist(t(assay(vsd)))
+dist_matrix <- as.matrix(sample_dists)
+rownames(dist_matrix) <- paste(colData(vsd)$cellLine, colData(vsd)$treatment, sep = " | ")
+colnames(dist_matrix) <- colnames(vsd)
+
+dist_args <- list(
+  mat = dist_matrix,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  color = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+  main = "Sample-to-sample distances"
+)
+
+do.call(pheatmap, dist_args)
+
+# pheatmap writes files via its own `filename` argument; a manual png()/dev.off()
+# wrapper does not capture its grid output reliably.
+invisible(do.call(pheatmap, c(
+  dist_args,
+  list(filename = file.path(fig_dir, "sample_distances.png"), width = 7, height = 5.5)
+)))
+```
+
+Samples are expected to pair up by cell line, reflecting donor as the dominant structure.
+
+## Differential expression results
+
+Two versions are kept deliberately: **unshrunk** effect sizes for the statistics, and
+**shrunk** effect sizes for ranking and plotting. Shrinkage pulls in the noisy fold changes
+of low-count genes without touching p-values.
+
+```{r}
+#| label: results
+
+res <- results(
+  dds,
+  contrast = c("treatment", "Dexamethasone", "Untreated"),
+  alpha = ALPHA
+)
+
+# apeglm is the preferred shrinkage estimator; degrade gracefully if it is absent
+# so a missing optional package cannot fail the render.
+shrink_type <- if (requireNamespace("apeglm", quietly = TRUE)) "apeglm" else "normal"
+if (shrink_type == "normal") {
+  message("apeglm not installed - falling back to type = 'normal' shrinkage.")
+}
+
+res_shrunk <- lfcShrink(
+  dds,
+  coef = "treatment_Dexamethasone_vs_Untreated",
+  type = shrink_type
+)
+
+summary(res)
+```
+
+```{r}
+#| label: results-counts
+
+n_sig  <- sum(res$padj < ALPHA, na.rm = TRUE)
+n_up   <- sum(res$padj < ALPHA & res$log2FoldChange > 0, na.rm = TRUE)
+n_down <- sum(res$padj < ALPHA & res$log2FoldChange < 0, na.rm = TRUE)
+
+cat(sprintf(
+  "At FDR < %.2f: %s genes differentially expressed (%s up, %s down) out of %s tested.\nShrinkage estimator: %s\n",
+  ALPHA,
+  format(n_sig, big.mark = ","), format(n_up, big.mark = ","),
+  format(n_down, big.mark = ","), format(sum(!is.na(res$padj)), big.mark = ","),
+  shrink_type
+))
+```
+
+### Annotate with gene symbols
+
+The matrix carries Ensembl IDs only. `org.Hs.eg.db` maps them offline, keeping the report
+reproducible; if it is unavailable the analysis proceeds on Ensembl IDs alone.
+
+```{r}
+#| label: annotate
+
+res_df <- as.data.frame(res) |>
+  rownames_to_column("gene_id") |>
+  mutate(log2FoldChange_shrunk = res_shrunk$log2FoldChange[match(gene_id, rownames(res_shrunk))])
+
+if (requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  res_df$symbol <- AnnotationDbi::mapIds(
+    org.Hs.eg.db::org.Hs.eg.db,
+    keys      = res_df$gene_id,
+    keytype   = "ENSEMBL",
+    column    = "SYMBOL",
+    multiVals = "first"
+  )
+  cat(sprintf("Mapped symbols for %s of %s genes.\n",
+              format(sum(!is.na(res_df$symbol)), big.mark = ","),
+              format(nrow(res_df), big.mark = ",")))
+} else {
+  res_df$symbol <- NA_character_
+  message("org.Hs.eg.db not installed - results reported with Ensembl IDs only.")
+}
+
+# Label preferring symbol, falling back to Ensembl ID
+res_df <- res_df |>
+  mutate(label = coalesce(symbol, gene_id)) |>
+  arrange(padj)
+```
+
+### Top differentially expressed genes
+
+```{r}
+#| label: top-genes
+
+res_df |>
+  slice_head(n = 25) |>
+  select(gene_id, symbol, baseMean, log2FoldChange, log2FoldChange_shrunk, pvalue, padj) |>
+  mutate(
+    baseMean = round(baseMean, 1),
+    across(starts_with("log2FoldChange"), \(x) round(x, 3)),
+    # p-values span many orders of magnitude; scientific notation keeps them readable
+    across(c(pvalue, padj), \(x) format(x, scientific = TRUE, digits = 3))
+  ) |>
+  knitr::kable(caption = "Top 25 genes by adjusted p-value")
+```
+
+### Sanity check against published markers
+
+Dexamethasone is a glucocorticoid; these four genes are well-established responders in this
+system and should all be **induced** (positive LFC). Matching is done by Ensembl ID so the
+check holds even without the annotation package.
+
+**If any fold change here is negative, the reference level is wrong** — that is the failure
+this check exists to catch.
+
+```{r}
+#| label: sanity-check
+
+markers <- tribble(
+  ~gene_id,          ~expected_symbol,
+  "ENSG00000120129", "DUSP1",
+  "ENSG00000163884", "KLF15",
+  "ENSG00000179094", "PER1",
+  "ENSG00000103196", "CRISPLD2"
+)
+
+marker_res <- markers |>
+  left_join(res_df, by = "gene_id") |>
+  select(gene_id, expected_symbol, mapped_symbol = symbol,
+         baseMean, log2FoldChange, padj)
+
+marker_res |>
+  mutate(
+    baseMean = round(baseMean, 1),
+    log2FoldChange = round(log2FoldChange, 3),
+    padj = format(padj, scientific = TRUE, digits = 3)
+  ) |>
+  knitr::kable(caption = "Known dexamethasone-responsive genes")
+
+if (all(marker_res$log2FoldChange > 0, na.rm = TRUE)) {
+  cat("PASS: all marker genes show positive log2 fold change (induced), as expected.\n")
+} else {
+  warning("Marker genes show unexpected direction - check the reference level and contrast.")
+}
+```
+
+## Figures
+
+### MA plot
+
+```{r}
+#| label: fig-ma
+
+p_ma <- res_df |>
+  filter(!is.na(padj)) |>
+  mutate(significant = padj < ALPHA) |>
+  ggplot(aes(x = baseMean, y = log2FoldChange_shrunk, colour = significant)) +
+  geom_point(alpha = 0.4, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey30") +
+  scale_x_log10() +
+  scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#d95f02"),
+                      labels = c(`FALSE` = "n.s.", `TRUE` = paste0("FDR < ", ALPHA))) +
+  labs(x = "Mean of normalised counts", y = "log2 fold change (shrunk)",
+       colour = NULL, title = "MA plot: Dexamethasone vs Untreated") +
+  theme_minimal()
+
+p_ma
+ggsave(file.path(fig_dir, "ma_plot.png"), p_ma, width = 7, height = 5, dpi = 150)
+```
+
+### Volcano plot
+
+```{r}
+#| label: fig-volcano
+
+volcano_data <- res_df |>
+  filter(!is.na(padj)) |>
+  mutate(
+    significant = padj < ALPHA & abs(log2FoldChange_shrunk) > 1,
+    neg_log10_padj = -log10(padj)
+  )
+
+p_volcano <- ggplot(volcano_data,
+                    aes(x = log2FoldChange_shrunk, y = neg_log10_padj, colour = significant)) +
+  geom_point(alpha = 0.4, size = 0.7) +
+  geom_hline(yintercept = -log10(ALPHA), linetype = "dashed", colour = "grey30") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey30") +
+  geom_text_repel(
+    data = slice_head(arrange(volcano_data, padj), n = 20),
+    aes(label = label), size = 3, max.overlaps = 20, show.legend = FALSE
+  ) +
+  scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "#7570b3"),
+                      labels = c(`FALSE` = "n.s.", `TRUE` = paste0("FDR < ", ALPHA, " & |LFC| > 1"))) +
+  labs(x = "log2 fold change (shrunk)", y = expression(-log[10]~adjusted~italic(p)),
+       colour = NULL, title = "Volcano plot: Dexamethasone vs Untreated") +
+  theme_minimal()
+
+p_volcano
+ggsave(file.path(fig_dir, "volcano_plot.png"), p_volcano, width = 8, height = 6, dpi = 150)
+```
+
+### Heatmap of top differentially expressed genes
+
+Variance-stabilised counts, centred per gene so the colour shows deviation from each gene's
+mean rather than absolute expression.
+
+```{r}
+#| label: fig-heatmap
+#| fig-height: 8
+
+top_genes <- res_df |>
+  filter(!is.na(padj)) |>
+  slice_head(n = 30)
+
+mat <- assay(vsd)[top_genes$gene_id, ]
+mat <- mat - rowMeans(mat)
+rownames(mat) <- top_genes$label
+
+annotation_col <- as.data.frame(colData(vsd)[, c("treatment", "cellLine")])
+
+heatmap_args <- list(
+  mat = mat,
+  annotation_col = annotation_col,
+  show_colnames = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(255),
+  main = "Top 30 DE genes (centred VST)"
+)
+
+do.call(pheatmap, heatmap_args)
+
+invisible(do.call(pheatmap, c(
+  heatmap_args,
+  list(filename = file.path(fig_dir, "heatmap_top_de_genes.png"), width = 8, height = 8)
+)))
+```
+
+## Export results
+
+```{r}
+#| label: export
+
+results_path <- file.path(repo_root, "results", "deseq2_results.csv")
+
+res_df |>
+  select(gene_id, symbol, baseMean, log2FoldChange, log2FoldChange_shrunk,
+         lfcSE, stat, pvalue, padj) |>
+  write_csv(results_path)
+
+cat(sprintf("Wrote %s rows to %s\n",
+            format(nrow(res_df), big.mark = ","), results_path))
+cat("Figures written to", fig_dir, "\n")
+```
+
+## Session info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

@@ -1,0 +1,379 @@
+---
+title: "Dexamethasone Differential Gene Expression (airway RNA-seq)"
+subtitle: "DESeq2 workflow — paired design across 4 airway smooth muscle cell lines"
+author: "Generated with Claude Code"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    df-print: paged
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+# Overview
+
+This document runs a complete bulk RNA-seq differential gene expression (DGE)
+analysis of the classic **airway** dataset (Himes et al. 2014, PMID: 24926665):
+the effect of **dexamethasone** (a glucocorticoid) on gene expression in human
+airway smooth muscle cells.
+
+**Design.** Four cell lines (`N61311`, `N052611`, `N080611`, `N061011`) were each
+profiled Untreated and Dexamethasone-treated — a **paired** design. Cell line is
+therefore modelled as a blocking factor:
+
+$$\text{design} = \sim \text{cellLine} + \text{treatment}$$
+
+so that the `treatment` effect is estimated *within* cell line, controlling for
+baseline between-line differences.
+
+Outputs are written to `results/` (tables) and `figures/` (plots).
+
+# Setup
+
+```{r}
+#| label: setup
+
+# --- One-time install (uncomment on a clean machine) -----------------------
+# install.packages(c("BiocManager", "ggplot2", "ggrepel", "pheatmap",
+#                     "RColorBrewer", "readr", "dplyr", "tibble"))
+# BiocManager::install(c("DESeq2", "apeglm"))
+# # Optional gene-symbol annotation:
+# BiocManager::install("org.Hs.eg.db")
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(readr)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+set.seed(1)
+
+# Output directories
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+
+# Analysis thresholds
+alpha_padj <- 0.05   # adjusted p-value significance cutoff
+lfc_thresh <- 1      # |log2FC| threshold for volcano highlighting
+```
+
+# Load and sanitise data
+
+We read the RSEM gene-level count matrix, drop the `transcript_id(s)` column,
+and **round counts to integers** — RSEM emits fractional (expected) counts, but
+DESeq2's negative-binomial model requires integers.
+
+```{r}
+#| label: load-data
+
+# --- Count matrix ----------------------------------------------------------
+raw <- read_tsv("data/rsem.merged.gene_counts.tsv", show_col_types = FALSE)
+
+count_mat <- raw |>
+  select(-`transcript_id(s)`) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+# RSEM expected counts are floats -> round to integer for DESeq2
+count_mat <- round(count_mat)
+storage.mode(count_mat) <- "integer"
+
+# --- Sample metadata -------------------------------------------------------
+coldata <- read_csv("data/experiment_table.csv", show_col_types = FALSE) |>
+  column_to_rownames("ID")
+
+# Factors; set Untreated as the reference so LFCs read as Dex-vs-Untreated
+coldata$treatment <- relevel(factor(coldata$treatment), ref = "Untreated")
+coldata$cellLine  <- factor(coldata$cellLine)
+
+# --- Align matrix columns to metadata rows (fail loudly if mismatched) -----
+stopifnot(setequal(colnames(count_mat), rownames(coldata)))
+count_mat <- count_mat[, rownames(coldata)]
+stopifnot(identical(colnames(count_mat), rownames(coldata)))
+
+dim(count_mat)
+coldata
+```
+
+# Build the DESeqDataSet
+
+```{r}
+#| label: build-dds
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+
+# Pre-filter: keep genes with >= 10 counts in at least `smallest group` samples.
+# Smallest group here = number of samples per treatment level (4).
+smallest_group <- min(table(coldata$treatment))
+keep <- rowSums(counts(dds) >= 10) >= smallest_group
+message(sprintf("Genes retained after filtering: %d of %d",
+                sum(keep), length(keep)))
+dds <- dds[keep, ]
+```
+
+# Run DESeq2
+
+```{r}
+#| label: run-deseq
+
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+# Quality control / exploratory analysis
+
+Variance-stabilising transform (VST) for visualisation. Because the modelled
+`treatment` effect is small relative to library-size variation, VST-normalised
+values give a fairer picture than raw counts.
+
+```{r}
+#| label: vst
+
+vsd <- vst(dds, blind = FALSE)
+```
+
+## PCA
+
+```{r}
+#| label: pca
+#| fig-cap: "PCA of VST-transformed counts, coloured by treatment and shaped by cell line."
+
+pca_df <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+pct <- round(100 * attr(pca_df, "percentVar"))
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
+  geom_point(size = 4) +
+  labs(x = sprintf("PC1: %d%% variance", pct[1]),
+       y = sprintf("PC2: %d%% variance", pct[2]),
+       title = "PCA — VST counts") +
+  theme_bw()
+
+p_pca
+ggsave("figures/pca.png", p_pca, width = 7, height = 5, dpi = 300)
+```
+
+## Sample-to-sample distances
+
+```{r}
+#| label: sample-dist
+#| fig-cap: "Euclidean distances between samples on VST-transformed data."
+
+samp_dist <- dist(t(assay(vsd)))
+dist_mat  <- as.matrix(samp_dist)
+rownames(dist_mat) <- paste(vsd$cellLine, vsd$treatment, sep = " | ")
+colnames(dist_mat) <- NULL
+cols <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+png("figures/sample_distance_heatmap.png", width = 7, height = 6,
+    units = "in", res = 300)
+pheatmap(dist_mat,
+         clustering_distance_rows = samp_dist,
+         clustering_distance_cols = samp_dist,
+         col = cols,
+         main = "Sample-to-sample distances")
+dev.off()
+
+pheatmap(dist_mat,
+         clustering_distance_rows = samp_dist,
+         clustering_distance_cols = samp_dist,
+         col = cols,
+         main = "Sample-to-sample distances")
+```
+
+# Differential expression results
+
+Contrast of interest: **Dexamethasone vs Untreated**. We apply `apeglm` LFC
+shrinkage for stable effect-size ranking (volcano / gene shortlists), while
+keeping the unshrunken table for reference.
+
+```{r}
+#| label: results
+
+coef_name <- "treatment_Dexamethasone_vs_Untreated"
+stopifnot(coef_name %in% resultsNames(dds))
+
+# Unshrunken results (for p-values / summary)
+res <- results(dds, name = coef_name, alpha = alpha_padj)
+summary(res)
+
+# Shrunken LFCs (for ranking & visualisation)
+res_shrink <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+```
+
+```{r}
+#| label: results-table
+
+res_df <- res_shrink |>
+  as.data.frame() |>
+  rownames_to_column("gene_id") |>
+  # bring in unshrunken stat + pvalue for completeness
+  left_join(
+    res |> as.data.frame() |> rownames_to_column("gene_id") |>
+      select(gene_id, stat, pvalue_raw = pvalue),
+    by = "gene_id"
+  ) |>
+  arrange(padj)
+
+head(res_df, 10)
+```
+
+# Diagnostics
+
+```{r}
+#| label: ma-plot
+#| fig-cap: "MA plot (shrunken LFCs)."
+
+png("figures/ma_plot.png", width = 7, height = 5, units = "in", res = 300)
+plotMA(res_shrink, ylim = c(-5, 5), main = "MA plot — Dex vs Untreated")
+dev.off()
+plotMA(res_shrink, ylim = c(-5, 5), main = "MA plot — Dex vs Untreated")
+```
+
+```{r}
+#| label: dispersion
+#| fig-cap: "Dispersion estimates."
+
+png("figures/dispersion.png", width = 7, height = 5, units = "in", res = 300)
+plotDispEsts(dds, main = "Dispersion estimates")
+dev.off()
+plotDispEsts(dds, main = "Dispersion estimates")
+```
+
+```{r}
+#| label: pval-hist
+#| fig-cap: "Raw p-value distribution (independent-filtering diagnostic)."
+
+hist(res$pvalue, breaks = 50, col = "grey", border = "white",
+     xlab = "raw p-value", main = "P-value histogram")
+```
+
+# Top-gene visualisations
+
+## Volcano plot
+
+```{r}
+#| label: volcano
+#| fig-cap: "Volcano plot of shrunken LFC vs -log10 adjusted p-value."
+
+volc <- res_df |>
+  filter(!is.na(padj)) |>
+  mutate(sig = case_when(
+    padj < alpha_padj & log2FoldChange >=  lfc_thresh ~ "Up",
+    padj < alpha_padj & log2FoldChange <= -lfc_thresh ~ "Down",
+    TRUE ~ "NS"
+  ))
+
+top_lab <- volc |> filter(sig != "NS") |> slice_min(padj, n = 15)
+
+p_volc <- ggplot(volc, aes(log2FoldChange, -log10(padj), colour = sig)) +
+  geom_point(alpha = 0.6, size = 1.4) +
+  scale_colour_manual(values = c(Up = "#c0392b", Down = "#2471a3", NS = "grey70")) +
+  geom_vline(xintercept = c(-lfc_thresh, lfc_thresh), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(alpha_padj), linetype = "dashed", colour = "grey50") +
+  ggrepel::geom_text_repel(data = top_lab, aes(label = gene_id),
+                           size = 2.6, max.overlaps = 20, show.legend = FALSE) +
+  labs(x = "log2 fold change (Dex vs Untreated)",
+       y = "-log10 adjusted p-value", colour = NULL,
+       title = "Volcano — Dexamethasone vs Untreated") +
+  theme_bw()
+
+p_volc
+ggsave("figures/volcano.png", p_volc, width = 7, height = 6, dpi = 300)
+```
+
+## Heatmap of top differentially expressed genes
+
+```{r}
+#| label: top-heatmap
+#| fig-cap: "Top 30 DE genes by adjusted p-value (VST, row z-scored)."
+
+top_genes <- res_df |> filter(!is.na(padj)) |> slice_min(padj, n = 30) |> pull(gene_id)
+
+mat <- assay(vsd)[top_genes, ]
+mat <- t(scale(t(mat)))  # row z-score
+
+ann_col <- as.data.frame(colData(dds)[, c("treatment", "cellLine")])
+
+png("figures/top_genes_heatmap.png", width = 8, height = 8, units = "in", res = 300)
+pheatmap(mat, annotation_col = ann_col,
+         show_colnames = FALSE, fontsize_row = 7,
+         main = "Top 30 DE genes (VST z-score)")
+dev.off()
+
+pheatmap(mat, annotation_col = ann_col,
+         show_colnames = FALSE, fontsize_row = 7,
+         main = "Top 30 DE genes (VST z-score)")
+```
+
+# Optional: gene-symbol annotation
+
+If `org.Hs.eg.db` is installed, map Ensembl gene IDs to HGNC symbols. This is
+fully offline (no biomaRt / network call). If the package is absent, the table
+keeps Ensembl IDs only.
+
+```{r}
+#| label: annotate
+
+if (requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  suppressPackageStartupMessages(library(org.Hs.eg.db))
+  res_df$symbol <- mapIds(org.Hs.eg.db,
+                          keys = res_df$gene_id,
+                          column = "SYMBOL",
+                          keytype = "ENSEMBL",
+                          multiVals = "first")
+  res_df <- res_df |> relocate(symbol, .after = gene_id)
+  message("Annotated with HGNC symbols via org.Hs.eg.db.")
+} else {
+  message("org.Hs.eg.db not installed - keeping Ensembl IDs only.")
+}
+
+head(res_df, 10)
+```
+
+# Export outputs
+
+```{r}
+#| label: export
+
+# Full results
+write_csv(res_df, "results/deseq2_results_full.csv")
+
+# Significant subset
+sig_df <- res_df |> filter(!is.na(padj), padj < alpha_padj) |> arrange(padj)
+write_csv(sig_df, "results/deseq2_results_significant.csv")
+
+# Normalised counts
+norm_counts <- counts(dds, normalized = TRUE) |>
+  as.data.frame() |>
+  rownames_to_column("gene_id")
+write_csv(norm_counts, "results/normalized_counts.csv")
+
+message(sprintf("Significant genes (padj < %.2f): %d", alpha_padj, nrow(sig_df)))
+message("Wrote: results/deseq2_results_full.csv, results/deseq2_results_significant.csv, results/normalized_counts.csv")
+```
+
+# Session info
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

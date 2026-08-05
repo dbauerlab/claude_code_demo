@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Quarto render artifacts
+/*.html
+/*_files/
+/.quarto/
+
+# Analysis outputs
+/results/
+/figures/

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "clawbio": {
+      "command": "uvx",
+      "args": ["--from", "clawbio[mcp]", "clawbio", "mcp"]
+    }
+  }
+}

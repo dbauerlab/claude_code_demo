@@ -1,0 +1,396 @@
+---
+title: "Airway RNA-seq: Dexamethasone vs Untreated (DESeq2)"
+author: "Generated with Claude Code"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    df-print: paged
+    fig-width: 7
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+```{r setup}
+#| label: setup
+
+# --- Packages -------------------------------------------------------------
+# If any of these are missing, install once (uncomment and run in a console):
+#
+#   install.packages(c("tidyverse", "pheatmap", "RColorBrewer"))
+#   if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#   BiocManager::install(c("DESeq2", "apeglm", "EnhancedVolcano"))
+#
+# The document renders end-to-end once these are available.
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+# EnhancedVolcano is optional; fall back to a ggplot volcano if unavailable.
+have_enhanced_volcano <- requireNamespace("EnhancedVolcano", quietly = TRUE)
+
+# --- Paths ----------------------------------------------------------------
+# Resolve the repository root robustly by searching upward from the working
+# directory until we find the data/ directory. This keeps the document working
+# whether it is rendered from the repo root or from a subfolder.
+find_repo_root <- function(start = getwd(), marker = "data") {
+  dir <- normalizePath(start, mustWork = FALSE)
+  for (i in 1:6) {
+    if (dir.exists(file.path(dir, marker)) &&
+        file.exists(file.path(dir, marker, "experiment_table.csv"))) {
+      return(dir)
+    }
+    parent <- dirname(dir)
+    if (identical(parent, dir)) break
+    dir <- parent
+  }
+  stop("Could not locate the repo root (a folder containing data/experiment_table.csv).")
+}
+
+here_root    <- find_repo_root()
+counts_path  <- file.path(here_root, "data", "rsem.merged.gene_counts.tsv")
+samples_path <- file.path(here_root, "data", "experiment_table.csv")
+
+results_dir <- file.path(here_root, "results")
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+stopifnot(file.exists(counts_path), file.exists(samples_path))
+
+# Analysis parameters
+alpha_fdr        <- 0.05   # FDR threshold for calling DE genes
+min_count        <- 10     # per-sample count floor for pre-filtering
+min_samples      <- 4      # genes must clear min_count in >= this many samples
+                           # (4 = size of the smallest treatment group)
+```
+
+# Overview
+
+This document runs a standard bulk RNA-seq differential-expression analysis on the
+**airway** dataset: primary human airway smooth muscle cells from four donors
+(cell lines), each sequenced **Untreated** and treated with **Dexamethasone**.
+
+The design is **paired** — the same donor appears in both conditions — so we block on
+`cellLine` and test the `treatment` effect:
+
+$$\text{design} = \sim \text{cellLine} + \text{treatment}$$
+
+`Untreated` is the reference level, so a positive log2 fold-change means the gene is
+**up in Dexamethasone** relative to Untreated.
+
+# Load inputs
+
+```{r load-inputs}
+#| label: load-inputs
+
+# Counts: gene_id, transcript_id(s), then one column per sample (SRA accession).
+counts_raw <- readr::read_tsv(counts_path, show_col_types = FALSE)
+
+# Sample sheet: ID (SRA accession), cellLine, treatment.
+coldata_raw <- readr::read_csv(samples_path, show_col_types = FALSE)
+
+dim(counts_raw)
+coldata_raw
+```
+
+```{r build-matrix}
+#| label: build-matrix
+
+# Drop non-count columns and set Ensembl gene IDs as rownames.
+count_mat <- counts_raw |>
+  dplyr::select(-`transcript_id(s)`) |>
+  tibble::column_to_rownames("gene_id") |>
+  as.matrix()
+
+# Sample sheet as a data frame with row order we control.
+coldata <- as.data.frame(coldata_raw)
+rownames(coldata) <- coldata$ID
+```
+
+# Align samples
+
+The count columns must line up with the sample sheet rows exactly. We reorder the
+matrix columns to match the sample-sheet `ID` order and then assert equality — if the
+inputs ever change, this fails loudly instead of producing silently wrong results.
+
+```{r align}
+#| label: align
+
+count_mat <- count_mat[, coldata$ID]
+stopifnot(identical(colnames(count_mat), coldata$ID))
+
+# Confirm the join is 1:1 over all 8 samples.
+stopifnot(ncol(count_mat) == nrow(coldata))
+colnames(count_mat)
+```
+
+# Round non-integer RSEM counts
+
+RSEM assigns ambiguous reads probabilistically, so its gene-level counts are
+**estimates, not integers** (e.g. `284.50`). DESeq2's negative-binomial model requires
+integer counts, so we round before building the dataset. (The more principled
+alternative is `tximport` on the per-sample RSEM files, which are not included in this
+repository — only the merged gene-level table is.)
+
+```{r round-counts}
+#| label: round-counts
+
+# Show that the raw matrix really is non-integer.
+any_non_integer <- any(count_mat != round(count_mat))
+cat("Matrix contains non-integer values:", any_non_integer, "\n")
+
+count_mat <- round(count_mat)
+storage.mode(count_mat) <- "integer"
+
+cat("Rounded matrix dimensions:", nrow(count_mat), "genes x",
+    ncol(count_mat), "samples\n")
+```
+
+# Factors and reference level
+
+```{r factors}
+#| label: factors
+
+coldata$cellLine  <- factor(coldata$cellLine)
+coldata$treatment <- factor(coldata$treatment)
+
+# Untreated is the baseline; log2FC will read as Dexamethasone-vs-Untreated.
+coldata$treatment <- relevel(coldata$treatment, ref = "Untreated")
+
+levels(coldata$treatment)
+table(coldata$cellLine, coldata$treatment)
+```
+
+# Build the DESeqDataSet and pre-filter
+
+```{r build-dds}
+#| label: build-dds
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+
+# Pre-filter: keep genes with at least `min_count` reads in at least
+# `min_samples` samples. This removes the large block of all-zero / very low
+# genes before fitting.
+keep <- rowSums(counts(dds) >= min_count) >= min_samples
+cat("Genes before filtering:", nrow(dds), "\n")
+dds  <- dds[keep, ]
+cat("Genes after filtering: ", nrow(dds), "\n")
+```
+
+# Run DESeq2
+
+```{r run-deseq}
+#| label: run-deseq
+
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+# Quality control
+
+Variance-stabilising transform, then PCA and a sample-distance heatmap. We expect
+samples to separate by treatment while pairing by donor (cell line).
+
+```{r vst}
+#| label: vst
+
+vsd <- vst(dds, blind = TRUE)
+```
+
+```{r pca}
+#| label: fig-pca
+#| fig-cap: "PCA of VST-transformed counts. Colour = treatment, shape = cell line."
+
+pca_df <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+pct    <- round(100 * attr(pca_df, "percentVar"))
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
+  geom_point(size = 4) +
+  labs(
+    x = paste0("PC1: ", pct[1], "% variance"),
+    y = paste0("PC2: ", pct[2], "% variance"),
+    title = "PCA of VST counts"
+  ) +
+  theme_bw(base_size = 13)
+
+p_pca
+ggsave(file.path(results_dir, "pca.png"), p_pca, width = 7, height = 5, dpi = 150)
+```
+
+```{r sample-distance}
+#| label: fig-sample-dist
+#| fig-cap: "Euclidean distances between samples on VST-transformed counts."
+
+sample_dists <- dist(t(assay(vsd)))
+dist_mat <- as.matrix(sample_dists)
+rownames(dist_mat) <- paste(vsd$treatment, vsd$cellLine, sep = " | ")
+colnames(dist_mat) <- rownames(dist_mat)
+
+pheatmap(
+  dist_mat,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+  main = "Sample-to-sample distances",
+  filename = file.path(results_dir, "sample_distance_heatmap.png"),
+  width = 7, height = 6
+)
+# Also draw inline (pheatmap writes to file when `filename` is set, so call again).
+pheatmap(
+  dist_mat,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+  main = "Sample-to-sample distances"
+)
+```
+
+# Differential expression results
+
+```{r results}
+#| label: results
+
+res <- results(
+  dds,
+  contrast = c("treatment", "Dexamethasone", "Untreated"),
+  alpha = alpha_fdr
+)
+
+# Shrunken log2 fold-changes for ranking and plotting.
+res_shrunk <- lfcShrink(dds, coef = "treatment_Dexamethasone_vs_Untreated",
+                        type = "apeglm")
+
+summary(res)
+
+n_de <- sum(res$padj < alpha_fdr, na.rm = TRUE)
+cat("Genes with padj <", alpha_fdr, ":", n_de, "\n")
+```
+
+```{r results-table}
+#| label: results-table
+
+res_df <- as.data.frame(res) |>
+  tibble::rownames_to_column("gene_id") |>
+  dplyr::arrange(padj)
+
+head(res_df, 15)
+```
+
+# Figures
+
+```{r ma-plot}
+#| label: fig-ma
+#| fig-cap: "MA plot of shrunken log2 fold-changes (Dexamethasone vs Untreated)."
+
+png(file.path(results_dir, "ma_plot.png"), width = 7, height = 5,
+    units = "in", res = 150)
+plotMA(res_shrunk, ylim = c(-5, 5), main = "MA plot (shrunken LFC)")
+invisible(dev.off())
+
+plotMA(res_shrunk, ylim = c(-5, 5), main = "MA plot (shrunken LFC)")
+```
+
+```{r volcano}
+#| label: fig-volcano
+#| fig-cap: "Volcano plot of differential expression."
+
+if (have_enhanced_volcano) {
+  p_volcano <- EnhancedVolcano::EnhancedVolcano(
+    res_df,
+    lab = res_df$gene_id,
+    x = "log2FoldChange",
+    y = "padj",
+    pCutoff = alpha_fdr,
+    FCcutoff = 1,
+    title = "Dexamethasone vs Untreated",
+    subtitle = NULL
+  )
+} else {
+  # ggplot fallback so the document always renders.
+  volc_df <- res_df |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(
+      sig = dplyr::case_when(
+        padj < alpha_fdr & log2FoldChange >=  1 ~ "Up",
+        padj < alpha_fdr & log2FoldChange <= -1 ~ "Down",
+        TRUE ~ "NS"
+      )
+    )
+  p_volcano <- ggplot(volc_df,
+                      aes(log2FoldChange, -log10(padj), colour = sig)) +
+    geom_point(alpha = 0.6, size = 1.4) +
+    scale_colour_manual(values = c(Up = "firebrick", Down = "steelblue",
+                                   NS = "grey70")) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey50") +
+    geom_hline(yintercept = -log10(alpha_fdr), linetype = "dashed",
+               colour = "grey50") +
+    labs(title = "Dexamethasone vs Untreated", colour = NULL) +
+    theme_bw(base_size = 13)
+}
+
+p_volcano
+ggsave(file.path(results_dir, "volcano.png"), p_volcano,
+       width = 8, height = 6, dpi = 150)
+```
+
+```{r top-gene-heatmap}
+#| label: fig-top-heatmap
+#| fig-cap: "Top 30 DE genes (by adjusted p-value) on VST-transformed counts, row-scaled."
+
+top_genes <- res_df |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::slice_min(padj, n = 30, with_ties = FALSE) |>
+  dplyr::pull(gene_id)
+
+mat <- assay(vsd)[top_genes, , drop = FALSE]
+mat <- t(scale(t(mat)))  # row-scale (z-score per gene)
+
+annot_col <- as.data.frame(colData(vsd)[, c("treatment", "cellLine")])
+
+pheatmap(
+  mat,
+  annotation_col = annot_col,
+  show_colnames = FALSE,
+  main = "Top 30 DE genes (VST, row-scaled)",
+  filename = file.path(results_dir, "top_genes_heatmap.png"),
+  width = 8, height = 8
+)
+pheatmap(
+  mat,
+  annotation_col = annot_col,
+  show_colnames = FALSE,
+  main = "Top 30 DE genes (VST, row-scaled)"
+)
+```
+
+# Export results
+
+```{r export}
+#| label: export
+
+out_csv <- file.path(results_dir, "deseq2_results.csv")
+readr::write_csv(res_df, out_csv)
+cat("Wrote full results table to:", out_csv, "\n")
+cat("Figures written to:", results_dir, "\n")
+```
+
+# Session info
+
+```{r session-info}
+#| label: session-info
+
+sessionInfo()
+```

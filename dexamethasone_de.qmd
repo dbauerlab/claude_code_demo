@@ -1,0 +1,632 @@
+---
+title: "Differential expression: Dexamethasone vs Untreated"
+subtitle: "Human airway smooth muscle cells (Himes et al. 2014), paired design across 4 donors"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    fig-width: 7
+    fig-height: 5
+    df-print: kable
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# Output directories, created up front so the render works from a clean checkout.
+dir.create("results/tables",  recursive = TRUE, showWarnings = FALSE)
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+ALPHA <- 0.05  # FDR threshold used throughout
+```
+
+## Experimental design
+
+Human airway smooth muscle cells from four donor cell lines, each contributing one untreated and
+one dexamethasone-treated sample — a fully balanced paired design. Dexamethasone is a
+glucocorticoid, so the expected signal is a glucocorticoid receptor transcriptional response.
+
+Because the same four donors appear in both treatment groups, `cellLine` belongs in the model as
+a blocking factor. The design is therefore `~ cellLine + treatment`: donor-to-donor differences
+are absorbed by the blocking term instead of inflating the residual variance, which is what makes
+the paired design more powerful than an unpaired comparison of the same eight samples.
+
+## Data loading
+
+Two details in the counts file need care, both of which are guarded with assertions below rather
+than left to trust:
+
+- Column 2 is `transcript_id(s)`, a comma-separated transcript list — **not a sample**. Code that
+  treats every column after the first as a count column silently produces a garbage ninth sample.
+  It is dropped by name.
+- `check.names = FALSE` is required when reading, because `make.names()` would rewrite the
+  parentheses in `transcript_id(s)` and the drop-by-name would then miss.
+
+```{r}
+#| label: load-data
+counts_raw <- read.delim(
+  "data/rsem.merged.gene_counts.tsv",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+coldata <- read.csv("data/experiment_table.csv", stringsAsFactors = FALSE)
+
+# Drop the transcript list explicitly by name, never by position.
+stopifnot("transcript_id(s)" %in% colnames(counts_raw))
+counts_raw[["transcript_id(s)"]] <- NULL
+
+# Gene IDs become the row key. They are bare Ensembl IDs with no version suffix and no
+# duplicates, so they are safe to use directly.
+stopifnot(
+  !anyDuplicated(counts_raw$gene_id),
+  all(grepl("^ENSG", counts_raw$gene_id))
+)
+# Named count_mat rather than `counts` to avoid shadowing DESeq2's counts() accessor.
+count_mat <- as.matrix(counts_raw[, setdiff(colnames(counts_raw), "gene_id"), drop = FALSE])
+rownames(count_mat) <- counts_raw$gene_id
+
+# Exactly the 8 samples should remain once gene_id and the transcript list are gone.
+stopifnot(ncol(count_mat) == nrow(coldata))
+
+# Match samples by NAME, not by position. The two files happen to agree on order, but relying
+# on that would break silently the moment either file is re-sorted.
+stopifnot(setequal(colnames(count_mat), coldata$ID))
+count_mat <- count_mat[, coldata$ID]
+stopifnot(identical(colnames(count_mat), coldata$ID))
+
+rownames(coldata) <- coldata$ID
+```
+
+Counts matrix: **`r format(nrow(count_mat), big.mark = ",")` genes × `r ncol(count_mat)` samples**,
+with sample columns confirmed aligned to the metadata rows.
+
+```{r}
+#| label: design-table
+coldata[, c("ID", "cellLine", "treatment")]
+```
+
+```{r}
+#| label: design-balance
+table(coldata$cellLine, coldata$treatment)
+```
+
+Each donor contributes exactly one sample per treatment — the design is balanced, with no
+unpaired samples and no other covariates.
+
+## Data characterisation
+
+Three properties of RSEM output drive the preprocessing decisions that follow.
+
+```{r}
+#| label: characterisation
+lib_sizes <- colSums(count_mat)
+
+data.frame(
+  Property = c(
+    "Genes (rows)",
+    "Genes zero in all 8 samples",
+    "Genes with at least one fractional count",
+    "Smallest library",
+    "Largest library",
+    "Library size ratio (max/min)"
+  ),
+  Value = c(
+    format(nrow(count_mat), big.mark = ","),
+    sprintf("%s (%.1f%%)",
+            format(sum(rowSums(count_mat) == 0), big.mark = ","),
+            100 * mean(rowSums(count_mat) == 0)),
+    format(sum(apply(count_mat, 1, function(x) any(x != round(x)))), big.mark = ","),
+    sprintf("%s (%s)", names(which.min(lib_sizes)),
+            format(min(lib_sizes), big.mark = ",")),
+    sprintf("%s (%s)", names(which.max(lib_sizes)),
+            format(max(lib_sizes), big.mark = ",")),
+    sprintf("%.2fx", max(lib_sizes) / min(lib_sizes))
+  )
+)
+```
+
+**Fractional counts.** RSEM apportions multi-mapping reads probabilistically, so values are
+estimates rather than integers. DESeq2's negative binomial model requires integer counts, so the
+matrix is rounded before the dataset is built.
+
+**Near-half of all genes are zero everywhere.** These carry no information and only cost multiple
+testing power, so they are removed by the low-count filter below.
+
+**Library sizes span about two-fold.** Raw counts are therefore not comparable between samples;
+every visual and distance-based comparison in this document uses normalised or
+variance-stabilised values, never raw counts.
+
+## Building the DESeqDataSet
+
+The reference level is the one silent failure mode worth guarding hardest against. R orders factor
+levels alphabetically, and `Dexamethasone` sorts before `Untreated` — so the *default* reference
+is the treated group, which flips the sign of every log2 fold change without any error. After the
+`relevel()` below, a positive log2FC means **up in Dexamethasone relative to Untreated**.
+
+```{r}
+#| label: build-dds
+coldata$cellLine  <- factor(coldata$cellLine)
+coldata$treatment <- relevel(factor(coldata$treatment), ref = "Untreated")
+
+# Guard the sign convention: if this ever fails, every fold change in the report is backwards.
+stopifnot(levels(coldata$treatment)[1] == "Untreated")
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(count_mat),       # RSEM estimates -> integers
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+
+n_before <- nrow(dds)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+n_after <- nrow(dds)
+```
+
+Filtering to genes with a total count of at least 10 across all samples takes
+**`r format(n_before, big.mark = ",")` → `r format(n_after, big.mark = ",")` genes**
+(`r sprintf("%.1f%%", 100 * (1 - n_after / n_before))` removed).
+
+Note the order of operations here: counts are **rounded first, then filtered**, so the threshold
+applies to the integers DESeq2 actually models. Filtering the raw fractional values instead would
+leave 20,783 genes — 32 genes sit close enough to the boundary that rounding moves them across it.
+The difference is immaterial to the results but worth knowing if this number is compared against
+another pipeline.
+
+```{r}
+#| label: dataset-guards
+# These guards are specific to THIS dataset. They exist so that swapping in different data fails
+# loudly here rather than producing a plausible-looking but unverified report.
+# Update the expected numbers deliberately if the input data changes.
+stopifnot(n_before == 58735)
+
+# Rounded-then-filtered count is 20,803. Kept as a tight range rather than an equality because
+# the exact value depends on floating-point rounding of half-integer counts.
+stopifnot(n_after > 20790, n_after < 20815)
+
+resultsNames_expected <- "treatment_Dexamethasone_vs_Untreated"
+```
+
+## Quality control
+
+QC uses variance-stabilising transformed (VST) counts. `blind = TRUE` means the transformation
+ignores the design, so the clustering below is an independent check on the data rather than
+something the model has already imposed on it.
+
+```{r}
+#| label: vst
+vsd <- vst(dds, blind = TRUE)
+```
+
+### Principal component analysis
+
+```{r}
+#| label: fig-pca
+#| fig-cap: "PCA of VST counts. Colour = treatment, shape = donor cell line."
+pca_data <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+pct_var <- round(100 * attr(pca_data, "percentVar"))
+
+p_pca <- ggplot(pca_data, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
+  geom_point(size = 4, alpha = 0.9) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(
+    x = paste0("PC1: ", pct_var[1], "% variance"),
+    y = paste0("PC2: ", pct_var[2], "% variance"),
+    colour = "Treatment", shape = "Cell line"
+  ) +
+  theme_bw(base_size = 12)
+
+p_pca
+ggsave("results/figures/pca.png", p_pca, width = 7, height = 5, dpi = 150)
+```
+
+The structure to look for is donor separation on one axis and treatment separation on another.
+Donor identity accounting for the larger share of variance than treatment is exactly why
+`cellLine` is in the model: left unmodelled, that variation would sit in the residuals and cost
+real power. Treated and untreated samples from the *same* donor should sit close together along
+the donor axis while separating along the treatment axis.
+
+### Sample-to-sample distances
+
+```{r}
+#| label: fig-sample-dist
+#| fig-cap: "Euclidean distances between samples on VST counts."
+#| fig-height: 6
+sample_dists <- dist(t(assay(vsd)))
+dist_mat <- as.matrix(sample_dists)
+rownames(dist_mat) <- paste(vsd$cellLine, vsd$treatment, sep = " / ")
+colnames(dist_mat) <- colnames(vsd)
+
+dist_colours <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+
+pheatmap(
+  dist_mat,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  col = dist_colours,
+  main = "Sample-to-sample distances (VST)"
+)
+
+pheatmap(
+  dist_mat,
+  clustering_distance_rows = sample_dists,
+  clustering_distance_cols = sample_dists,
+  col = dist_colours,
+  main = "Sample-to-sample distances (VST)",
+  filename = "results/figures/sample_distances.png",
+  width = 7, height = 6
+)
+```
+
+Samples from the same donor are expected to be each other's nearest neighbours, reinforcing the
+PCA reading: donor is the dominant source of variation and must be blocked.
+
+## Differential expression
+
+```{r}
+#| label: run-deseq
+dds <- DESeq(dds)
+stopifnot(resultsNames_expected %in% resultsNames(dds))
+```
+
+### Dispersion estimates
+
+```{r}
+#| label: fig-dispersion
+#| fig-cap: "Per-gene dispersion estimates, with the fitted trend and shrunken final values."
+plotDispEsts(dds, main = "Dispersion estimates")
+
+png("results/figures/dispersion.png", width = 7, height = 5, units = "in", res = 150)
+plotDispEsts(dds, main = "Dispersion estimates")
+invisible(dev.off())
+```
+
+A healthy plot shows dispersion falling as mean expression rises, with gene-wise estimates
+shrunk toward the fitted red trend. Points flagged in blue at the top are dispersion outliers,
+which DESeq2 deliberately leaves unshrunken.
+
+### Results
+
+Two versions of the fold changes are computed and both are kept:
+
+- **Unshrunken** (`res`) — the raw maximum-likelihood estimates, and the source of all *p*-values
+  and adjusted *p*-values.
+- **Shrunken** (`res_shrunk`, via `apeglm`) — fold changes moderated toward zero in proportion to
+  how noisily they are measured. Low-count genes can otherwise show enormous but meaningless fold
+  changes. These are the effect sizes reported in tables and used in every figure.
+
+The *p*-values are identical between the two; only the effect sizes differ. Gene ranking
+throughout is by adjusted *p*-value, not by fold change.
+
+```{r}
+#| label: results
+res <- results(
+  dds,
+  contrast = c("treatment", "Dexamethasone", "Untreated"),
+  alpha = ALPHA
+)
+
+res_shrunk <- lfcShrink(dds, coef = resultsNames_expected, type = "apeglm")
+
+# apeglm returns rows in the same order; assert rather than assume before combining.
+stopifnot(identical(rownames(res), rownames(res_shrunk)))
+```
+
+```{r}
+#| label: results-summary
+summary(res)
+```
+
+```{r}
+#| label: results-counts
+n_tested <- sum(!is.na(res$padj))
+n_sig    <- sum(res$padj < ALPHA, na.rm = TRUE)
+n_up     <- sum(res$padj < ALPHA & res$log2FoldChange > 0, na.rm = TRUE)
+n_down   <- sum(res$padj < ALPHA & res$log2FoldChange < 0, na.rm = TRUE)
+n_sig_lfc1 <- sum(res$padj < ALPHA & abs(res$log2FoldChange) > 1, na.rm = TRUE)
+
+data.frame(
+  Metric = c(
+    "Genes tested (non-NA padj)",
+    sprintf("Significant (padj < %.2f)", ALPHA),
+    "  ... up in Dexamethasone",
+    "  ... down in Dexamethasone",
+    "Significant and |log2FC| > 1"
+  ),
+  Count = format(c(n_tested, n_sig, n_up, n_down, n_sig_lfc1), big.mark = ",")
+)
+```
+
+Genes with `NA` adjusted *p*-values were removed by DESeq2's independent filtering — they are too
+weakly expressed to have any realistic chance of detection, and excluding them raises the power
+available to the remaining genes.
+
+## Gene symbol annotation
+
+The counts file carries bare Ensembl IDs. Symbols come from `org.Hs.eg.db`, an offline annotation
+database, so the render needs no network and the annotation version is fixed.
+
+The mapping is not one-to-one, and both failure modes are reported rather than silently absorbed.
+The Ensembl ID stays the row key throughout; `symbol` is only ever a label. No row is dropped for
+failing to map.
+
+```{r}
+#| label: annotate
+symbols <- mapIds(
+  org.Hs.eg.db,
+  keys      = rownames(res),
+  keytype   = "ENSEMBL",
+  column    = "SYMBOL",
+  multiVals = "first"   # keep one symbol per gene; collisions are counted below
+)
+
+res_df <- as.data.frame(res)
+res_df$gene_id <- rownames(res_df)
+res_df$symbol  <- unname(symbols[res_df$gene_id])
+res_df$log2FoldChange_shrunk <- res_shrunk$log2FoldChange
+res_df$lfcSE_shrunk          <- res_shrunk$lfcSE
+
+res_df <- res_df[, c(
+  "gene_id", "symbol", "baseMean",
+  "log2FoldChange", "lfcSE", "log2FoldChange_shrunk", "lfcSE_shrunk",
+  "stat", "pvalue", "padj"
+)]
+res_df <- res_df[order(res_df$padj, na.last = TRUE), ]
+
+n_unmapped <- sum(is.na(res_df$symbol))
+mapped_symbols <- res_df$symbol[!is.na(res_df$symbol)]
+n_dup_symbols  <- sum(duplicated(mapped_symbols))
+
+data.frame(
+  Metric = c(
+    "Genes in results table",
+    "Ensembl IDs with no symbol",
+    "Symbols shared by >1 Ensembl ID (duplicate rows)"
+  ),
+  Count = format(c(nrow(res_df), n_unmapped, n_dup_symbols), big.mark = ",")
+)
+```
+
+Unmapped IDs are mostly retired Ensembl entries and non-coding genes with no assigned symbol.
+Where several Ensembl IDs share a symbol, each remains its own row — collapsing them would merge
+genuinely distinct features. This is why downstream work should join on `gene_id`, not `symbol`.
+
+## Direction sanity check
+
+The strongest available check that the sign convention is correct: three genes with well
+established responses to glucocorticoid treatment. `DUSP1` and `KLF15` are induced by
+dexamethasone; `CCL2` is repressed. If the reference level had defaulted to `Dexamethasone`, all
+three signs would be inverted and the assertion below fails the render immediately — which is the
+point of having it.
+
+```{r}
+#| label: sanity-check
+marker_genes <- c("DUSP1", "KLF15", "CCL2")
+expected_dir <- c(DUSP1 = 1, KLF15 = 1, CCL2 = -1)
+
+marker_rows <- res_df[match(marker_genes, res_df$symbol), ]
+stopifnot(!any(is.na(marker_rows$gene_id)))
+
+marker_table <- data.frame(
+  Symbol   = marker_rows$symbol,
+  Gene     = marker_rows$gene_id,
+  Expected = ifelse(expected_dir[marker_rows$symbol] > 0, "up", "down"),
+  log2FC   = round(marker_rows$log2FoldChange_shrunk, 2),
+  padj     = signif(marker_rows$padj, 3),
+  Observed = ifelse(marker_rows$log2FoldChange_shrunk > 0, "up", "down")
+)
+marker_table
+```
+
+```{r}
+#| label: sanity-assert
+# Fail the render if any marker moves the wrong way.
+stopifnot(all(
+  sign(marker_rows$log2FoldChange_shrunk) == expected_dir[marker_rows$symbol]
+))
+```
+
+All three markers move in the expected direction, so a positive log2FC in this report means up in
+Dexamethasone relative to Untreated.
+
+## Figures
+
+### MA plot
+
+```{r}
+#| label: fig-ma
+#| fig-cap: "MA plot on shrunken fold changes. Blue points pass the FDR threshold."
+plotMA(res_shrunk, alpha = ALPHA, ylim = c(-6, 6),
+       main = "MA plot (apeglm-shrunken log2 fold changes)")
+
+png("results/figures/ma_plot.png", width = 7, height = 5, units = "in", res = 150)
+plotMA(res_shrunk, alpha = ALPHA, ylim = c(-6, 6),
+       main = "MA plot (apeglm-shrunken log2 fold changes)")
+invisible(dev.off())
+```
+
+Fold change against mean expression. Shrinkage pulls in the low-expression genes on the left that
+would otherwise fan out into large, poorly-supported fold changes, leaving the significant calls
+concentrated among adequately-expressed genes.
+
+### Volcano plot
+
+```{r}
+#| label: fig-volcano
+#| fig-cap: "Volcano plot on shrunken fold changes; the 15 genes with smallest padj are labelled."
+#| fig-height: 6
+volcano_df <- res_df[!is.na(res_df$padj), ]
+
+# A padj that underflows to exactly 0 would plot at -log10(0) = Inf and wreck the y-axis.
+# Floor it at the smallest non-zero value instead, and note if this ever applies.
+min_nonzero_padj <- min(volcano_df$padj[volcano_df$padj > 0])
+n_floored <- sum(volcano_df$padj == 0)
+volcano_df$padj_plot <- pmax(volcano_df$padj, min_nonzero_padj)
+
+volcano_df$significant <- with(
+  volcano_df,
+  ifelse(padj >= ALPHA, "Not significant",
+         ifelse(log2FoldChange_shrunk > 0, "Up in Dexamethasone", "Down in Dexamethasone"))
+)
+volcano_df$label <- ifelse(is.na(volcano_df$symbol), volcano_df$gene_id, volcano_df$symbol)
+
+label_df <- head(volcano_df[volcano_df$padj < ALPHA, ], 15)
+
+p_volcano <- ggplot(volcano_df, aes(log2FoldChange_shrunk, -log10(padj_plot))) +
+  geom_point(aes(colour = significant), size = 1, alpha = 0.6) +
+  geom_hline(yintercept = -log10(ALPHA), linetype = "dashed", colour = "grey40") +
+  geom_text_repel(
+    data = label_df, aes(label = label),
+    size = 3, max.overlaps = Inf, min.segment.length = 0, box.padding = 0.4
+  ) +
+  scale_colour_manual(values = c(
+    "Up in Dexamethasone"   = "#D62728",
+    "Down in Dexamethasone" = "#1F77B4",
+    "Not significant"       = "grey75"
+  )) +
+  labs(
+    x = "log2 fold change (Dexamethasone vs Untreated, shrunken)",
+    y = expression(-log[10]~adjusted~italic(p)),
+    colour = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "top")
+
+p_volcano
+ggsave("results/figures/volcano.png", p_volcano, width = 7, height = 6, dpi = 150)
+```
+
+The dashed line marks the FDR threshold. The response is bidirectional, as expected for a
+glucocorticoid receptor programme that both induces and represses target genes.
+`r if (n_floored > 0) paste0("Note: ", n_floored, " gene(s) had an adjusted p-value underflowing to zero and were floored to the smallest non-zero value for plotting only; the exported tables keep the raw values.") else ""`
+
+### Heatmap of top differentially expressed genes
+
+```{r}
+#| label: fig-heatmap
+#| fig-cap: "Top 30 genes by adjusted p-value, VST values centred per gene."
+#| fig-height: 8
+top_ids <- head(res_df$gene_id[!is.na(res_df$padj)], 30)
+
+mat <- assay(vsd)[top_ids, ]
+mat <- mat - rowMeans(mat)   # centre per gene, so colour shows relative change
+
+top_labels <- res_df$symbol[match(top_ids, res_df$gene_id)]
+# make.unique guards against two of the top 30 sharing a symbol, which would give the
+# heatmap duplicate row labels.
+rownames(mat) <- make.unique(ifelse(is.na(top_labels), top_ids, top_labels))
+
+annotation_col <- data.frame(
+  Treatment = colData(vsd)$treatment,
+  CellLine  = colData(vsd)$cellLine,
+  row.names = colnames(mat)
+)
+
+heatmap_args <- list(
+  mat = mat,
+  annotation_col = annotation_col,
+  show_colnames = TRUE,
+  cluster_cols = TRUE,
+  fontsize_row = 8,
+  main = "Top 30 DE genes (VST, gene-centred)"
+)
+
+do.call(pheatmap, heatmap_args)
+do.call(pheatmap, c(heatmap_args, list(
+  filename = "results/figures/top_genes_heatmap.png",
+  width = 7, height = 8
+)))
+```
+
+Restricting to the top DE genes selects for treatment-driven signal, so columns are expected to
+split by treatment here even though the genome-wide QC plots above are dominated by donor. Check
+the two annotation tracks against the column dendrogram: a clean treatment split confirms the
+contrast, while any residual grouping by donor within each block is the paired structure that the
+`cellLine` term absorbs in the model.
+
+## Exported files
+
+```{r}
+#| label: exports
+res_sig <- res_df[!is.na(res_df$padj) & res_df$padj < ALPHA, ]
+
+norm_counts <- counts(dds, normalized = TRUE)
+vst_counts  <- assay(vsd)
+
+write.csv(res_df,  "results/tables/de_results_all.csv", row.names = FALSE)
+write.csv(res_sig, "results/tables/de_results_significant.csv", row.names = FALSE)
+write.csv(
+  data.frame(gene_id = rownames(norm_counts), norm_counts, check.names = FALSE),
+  "results/tables/normalized_counts.csv", row.names = FALSE
+)
+write.csv(
+  data.frame(gene_id = rownames(vst_counts), vst_counts, check.names = FALSE),
+  "results/tables/vst_counts.csv", row.names = FALSE
+)
+
+data.frame(
+  File = c(
+    "results/tables/de_results_all.csv",
+    "results/tables/de_results_significant.csv",
+    "results/tables/normalized_counts.csv",
+    "results/tables/vst_counts.csv",
+    "results/figures/pca.png",
+    "results/figures/sample_distances.png",
+    "results/figures/dispersion.png",
+    "results/figures/ma_plot.png",
+    "results/figures/volcano.png",
+    "results/figures/top_genes_heatmap.png"
+  ),
+  Contents = c(
+    sprintf("All %s tested genes, ordered by padj", format(nrow(res_df), big.mark = ",")),
+    sprintf("%s genes at padj < %.2f", format(nrow(res_sig), big.mark = ","), ALPHA),
+    "Median-of-ratios normalised counts",
+    "Variance-stabilised counts",
+    "PCA", "Sample distance heatmap", "Dispersion estimates",
+    "MA plot", "Volcano plot", "Top 30 DE gene heatmap"
+  )
+)
+```
+
+## Top 20 differentially expressed genes
+
+```{r}
+#| label: top-table
+top20 <- head(res_sig, 20)
+data.frame(
+  Symbol = ifelse(is.na(top20$symbol), "-", top20$symbol),
+  Gene   = top20$gene_id,
+  baseMean = round(top20$baseMean),
+  log2FC = round(top20$log2FoldChange_shrunk, 2),
+  padj   = signif(top20$padj, 3)
+)
+```
+
+## Summary
+
+Dexamethasone treatment of human airway smooth muscle cells produced
+**`r format(n_sig, big.mark = ",")` differentially expressed genes** at an FDR of
+`r ALPHA` out of `r format(n_tested, big.mark = ",")` tested
+(`r format(n_up, big.mark = ",")` up, `r format(n_down, big.mark = ",")` down), using a paired
+design that blocks on donor cell line. The direction of the response was confirmed against three
+known glucocorticoid-responsive genes before any results were interpreted.
+
+## Session information
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

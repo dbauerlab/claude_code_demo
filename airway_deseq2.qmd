@@ -1,0 +1,339 @@
+---
+title: "Airway RNA-seq: Dexamethasone vs Untreated (DESeq2)"
+subtitle: "Paired differential-expression analysis (`~ cellLine + treatment`)"
+author: "ClawBio demo"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    df-print: paged
+    embed-resources: true
+    fig-width: 7
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+## Overview
+
+This report runs the full bulk RNA-seq differential-expression workflow for the
+**airway** experiment: human airway smooth-muscle cell lines treated with
+dexamethasone versus untreated controls. The design is **paired** — each of four
+donor cell lines contributes one treated and one untreated sample — so we block on
+`cellLine` and test the `treatment` effect with the design `~ cellLine + treatment`.
+
+Inputs (read from `data/`):
+
+- `experiment_table.csv` — sample sheet (`ID`, `cellLine`, `treatment`), 8 samples.
+- `rsem.merged.gene_counts.tsv` — RSEM gene-level **expected counts** (non-integer),
+  one column per sample.
+
+Key conventions (see `CLAUDE.md`):
+
+- `Untreated` is the **reference** level, so log2 fold changes are
+  Dexamethasone-vs-Untreated.
+- RSEM expected counts are **non-integer** and are **rounded** before DESeq2.
+- Ensembl IDs are mapped to gene symbols via `org.Hs.eg.db`.
+
+> **Dependencies.** This notebook needs the following packages. They are *not*
+> installed automatically — uncomment and run once on a fresh machine:
+>
+> ```r
+> # install.packages("BiocManager")
+> # BiocManager::install(c("DESeq2", "apeglm", "org.Hs.eg.db"))
+> # install.packages(c("tidyverse", "pheatmap", "RColorBrewer", "ggrepel"))
+> ```
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(dplyr)
+  library(tibble)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ggrepel)
+  library(org.Hs.eg.db)
+})
+
+set.seed(1)
+
+# All outputs are written here.
+results_dir <- "results"
+dir.create(results_dir, showWarnings = FALSE)
+```
+
+## Load and validate inputs
+
+We read the sample sheet and the count matrix, then **subset and order the count
+columns by the sample sheet** — this makes the column/row correspondence explicit
+and robust to any future reordering rather than assuming it.
+
+```{r load-data}
+# --- Sample sheet -----------------------------------------------------------
+coldata <- read.csv("data/experiment_table.csv", stringsAsFactors = FALSE)
+
+# Untreated as the reference level => coefficient is Dexamethasone vs Untreated.
+coldata$treatment <- relevel(factor(coldata$treatment), ref = "Untreated")
+coldata$cellLine  <- factor(coldata$cellLine)
+rownames(coldata) <- coldata$ID
+
+# --- Count matrix -----------------------------------------------------------
+# check.names = FALSE keeps the literal "transcript_id(s)" / SRR column names.
+counts_raw <- read.delim(
+  "data/rsem.merged.gene_counts.tsv",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# Every sample-sheet ID must be present as a count column.
+stopifnot(all(coldata$ID %in% colnames(counts_raw)))
+
+# Build the numeric matrix, columns ordered exactly as the sample sheet.
+count_mat <- as.matrix(counts_raw[, coldata$ID, drop = FALSE])
+rownames(count_mat) <- counts_raw$gene_id
+mode(count_mat) <- "numeric"
+
+# RSEM expected counts are non-integer -> round for DESeq2 (needs integers).
+count_mat <- round(count_mat)
+storage.mode(count_mat) <- "integer"
+
+# Sanity checks: alignment and no NAs introduced.
+stopifnot(identical(colnames(count_mat), coldata$ID))
+stopifnot(!anyNA(count_mat))
+
+cat(sprintf("Genes: %d   Samples: %d\n", nrow(count_mat), ncol(count_mat)))
+```
+
+The design table:
+
+```{r show-coldata}
+coldata[, c("ID", "cellLine", "treatment")]
+```
+
+Confirm the paired layout — every cell line should have exactly one `Untreated`
+and one `Dexamethasone` sample:
+
+```{r check-balance}
+table(coldata$cellLine, coldata$treatment)
+```
+
+## Build the DESeq2 dataset
+
+```{r build-dds}
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = coldata,
+  design    = ~ cellLine + treatment
+)
+dds
+```
+
+### Pre-filter low-count genes
+
+The smallest group has 4 samples, so we keep genes with at least **10 counts in at
+least 4 samples**. This removes the large block of all-zero / near-zero genes before
+testing.
+
+```{r prefilter}
+n_before <- nrow(dds)
+keep <- rowSums(counts(dds) >= 10) >= 4
+dds  <- dds[keep, ]
+n_after <- nrow(dds)
+
+cat(sprintf("Genes before filter: %d\nGenes after filter:  %d  (removed %d)\n",
+            n_before, n_after, n_before - n_after))
+```
+
+## Run the differential-expression test
+
+```{r run-deseq}
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+We extract the treatment contrast and apply **apeglm** shrinkage for stable effect
+sizes and ranking.
+
+```{r extract-results}
+coef_name <- "treatment_Dexamethasone_vs_Untreated"
+stopifnot(coef_name %in% resultsNames(dds))
+
+res    <- results(dds, name = coef_name, alpha = 0.05)
+resLFC <- lfcShrink(dds, coef = coef_name, type = "apeglm")
+
+summary(res)
+```
+
+Number of significant genes at FDR < 0.05:
+
+```{r sig-counts}
+sig <- !is.na(res$padj) & res$padj < 0.05
+cat(sprintf("Significant (padj < 0.05): %d\n  up:   %d\n  down: %d\n",
+            sum(sig),
+            sum(sig & res$log2FoldChange > 0),
+            sum(sig & res$log2FoldChange < 0)))
+```
+
+## Quality control
+
+Variance-stabilised counts (`vst`) are used for all exploratory plots.
+
+```{r vst}
+vsd <- vst(dds, blind = FALSE)
+```
+
+### PCA
+
+Colour = treatment, shape = cell line. In a well-behaved paired design, PC1 or PC2
+should separate treated from untreated while cell lines stay identifiable.
+
+```{r pca, fig.width=7, fig.height=5}
+pca_df <- plotPCA(vsd, intgroup = c("treatment", "cellLine"), returnData = TRUE)
+pct <- round(100 * attr(pca_df, "percentVar"))
+
+ggplot(pca_df, aes(PC1, PC2, colour = treatment, shape = cellLine)) +
+  geom_point(size = 4) +
+  labs(x = sprintf("PC1: %d%% variance", pct[1]),
+       y = sprintf("PC2: %d%% variance", pct[2]),
+       title = "PCA of variance-stabilised counts") +
+  theme_bw()
+```
+
+### Sample-to-sample distances
+
+```{r dist-heatmap, fig.width=7, fig.height=6}
+sample_dists <- dist(t(assay(vsd)))
+dist_mat <- as.matrix(sample_dists)
+labels <- paste(vsd$cellLine, vsd$treatment, sep = " | ")
+rownames(dist_mat) <- labels
+colnames(dist_mat) <- labels
+
+pheatmap(dist_mat,
+         clustering_distance_rows = sample_dists,
+         clustering_distance_cols = sample_dists,
+         col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+         main = "Sample-to-sample distances")
+```
+
+## Annotate and assemble results
+
+Map unversioned Ensembl gene IDs to gene symbols. `multiVals = "first"` resolves the
+occasional 1-to-many mapping deterministically.
+
+```{r annotate}
+res_df <- as.data.frame(resLFC) |>
+  rownames_to_column("gene_id")
+
+# Bring in the unshrunken padj / stat as the significance basis.
+res_df$padj_deseq <- res$padj[match(res_df$gene_id, rownames(res))]
+
+res_df$symbol <- mapIds(
+  org.Hs.eg.db,
+  keys      = res_df$gene_id,
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+res_df <- res_df |>
+  dplyr::select(gene_id, symbol, baseMean, log2FoldChange, lfcSE, padj = padj_deseq) |>
+  arrange(padj)
+
+head(res_df, 20)
+```
+
+## Visualisation
+
+### MA plot
+
+```{r ma-plot, fig.width=7, fig.height=5}
+plotMA(resLFC, ylim = c(-5, 5), main = "MA plot (apeglm-shrunk LFC)")
+```
+
+### Volcano plot
+
+```{r volcano, fig.width=7, fig.height=6}
+volc <- res_df |>
+  filter(!is.na(padj)) |>
+  mutate(
+    neglog10p = -log10(padj),
+    status = case_when(
+      padj < 0.05 & log2FoldChange >=  1 ~ "Up",
+      padj < 0.05 & log2FoldChange <= -1 ~ "Down",
+      TRUE                               ~ "n.s."
+    )
+  )
+
+top_label <- volc |> filter(status != "n.s.") |> arrange(padj) |> head(15)
+
+ggplot(volc, aes(log2FoldChange, neglog10p, colour = status)) +
+  geom_point(alpha = 0.6, size = 1.4) +
+  scale_colour_manual(values = c(Up = "#c0392b", Down = "#2c6fbb", `n.s.` = "grey70")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  geom_text_repel(data = top_label,
+                  aes(label = ifelse(is.na(symbol), gene_id, symbol)),
+                  size = 3, max.overlaps = 20, show.legend = FALSE) +
+  labs(x = "log2 fold change (Dex vs Untreated)",
+       y = "-log10 adjusted p-value",
+       colour = NULL,
+       title = "Volcano: Dexamethasone vs Untreated") +
+  theme_bw()
+```
+
+### Heatmap of top differential genes
+
+```{r top-heatmap, fig.width=7, fig.height=8}
+top_genes <- res_df |> filter(!is.na(padj)) |> arrange(padj) |> head(40) |> pull(gene_id)
+
+mat <- assay(vsd)[top_genes, ]
+mat <- t(scale(t(mat)))                     # row-wise z-score
+row_labels <- res_df$symbol[match(top_genes, res_df$gene_id)]
+row_labels <- ifelse(is.na(row_labels), top_genes, row_labels)
+rownames(mat) <- row_labels
+
+ann_col <- as.data.frame(colData(vsd)[, c("treatment", "cellLine")])
+
+pheatmap(mat,
+         annotation_col = ann_col,
+         show_colnames = FALSE,
+         color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(255),
+         main = "Top 40 DE genes (vst, row z-scored)")
+```
+
+## Export outputs
+
+```{r export}
+# Full results table (all tested genes).
+write.csv(res_df,
+          file.path(results_dir, "deseq2_results_all.csv"),
+          row.names = FALSE)
+
+# Significant subset.
+sig_df <- res_df |> filter(!is.na(padj) & padj < 0.05)
+write.csv(sig_df,
+          file.path(results_dir, "deseq2_results_significant.csv"),
+          row.names = FALSE)
+
+# Normalised counts for downstream use.
+norm_counts <- counts(dds, normalized = TRUE) |>
+  as.data.frame() |>
+  rownames_to_column("gene_id")
+write.csv(norm_counts,
+          file.path(results_dir, "normalized_counts.csv"),
+          row.names = FALSE)
+
+cat(sprintf("Wrote to %s/:\n  deseq2_results_all.csv (%d genes)\n  deseq2_results_significant.csv (%d genes)\n  normalized_counts.csv\n",
+            results_dir, nrow(res_df), nrow(sig_df)))
+```
+
+## Reproducibility
+
+```{r session-info}
+sessionInfo()
+```

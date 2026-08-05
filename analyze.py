@@ -211,7 +211,7 @@ def prepare_counts(counts_gxs: pd.DataFrame):
     return counts_f
 
 
-def run_deseq(counts_f: pd.DataFrame, coldata: pd.DataFrame, design_factors):
+def run_deseq(counts_f: pd.DataFrame, coldata: pd.DataFrame):
     """
     Build a DeseqDataSet and fit it. ``counts`` for PyDESeq2 is samples x genes (AnnData
     orientation), so the gene x sample matrix is transposed here.
@@ -222,26 +222,23 @@ def run_deseq(counts_f: pd.DataFrame, coldata: pd.DataFrame, design_factors):
     counts_sxg = counts_f.T  # samples x genes
     metadata = coldata.set_index("ID")[["cellLine", "treatment"]].loc[counts_sxg.index]
     metadata["cellLine"] = metadata["cellLine"].astype(str)
-    metadata["treatment"] = metadata["treatment"].astype(str)
+    # Set the reference level as the FIRST category: formulaic uses the first category of a
+    # categorical as the base, so this makes Untreated the reference and yields a clean
+    # 'treatment[T.Dexamethasone]' coefficient -- positive LFC = induced by dexamethasone.
+    # (PyDESeq2's ref_level argument is deprecated in 0.5.x; encoding it here is the
+    # supported route, and the coefficient-name assertion below fails loudly if it slips.)
+    metadata["treatment"] = pd.Categorical(
+        metadata["treatment"], categories=["Untreated", "Dexamethasone"]
+    )
     assert list(metadata.index) == list(counts_sxg.index), "metadata/count sample mismatch"
 
-    inference = DefaultInference()
-
-    common = dict(
+    dds = DeseqDataSet(
         counts=counts_sxg,
         metadata=metadata,
-        # Untreated as reference => positive LFC means induced by dexamethasone. Asserted
-        # again after fitting via the coefficient name.
-        ref_level=["treatment", "Untreated"],
+        design="~cellLine + treatment",
         refit_cooks=True,
-        inference=inference,
+        inference=DefaultInference(),
     )
-    # Prefer the formula API; fall back to design_factors on older PyDESeq2.
-    try:
-        dds = DeseqDataSet(design="~cellLine + treatment", **common)
-    except TypeError:
-        dds = DeseqDataSet(design_factors=design_factors, **common)
-
     dds.deseq2()
     return dds
 
@@ -404,11 +401,12 @@ def plot_sample_distances(vst_df, dds, figdir):
 
 def plot_dispersions(dds, figdir):
     try:
-        means = np.asarray(dds.layers["normed_counts"]).mean(axis=0)
-        genewise = np.asarray(dds.varm["genewise_dispersions"])
-        fitted = np.asarray(dds.varm["fitted_dispersions"])
-        final = np.asarray(dds.varm["dispersions"])
-        ok = means > 0
+        # PyDESeq2 stores per-gene dispersions and mean counts in dds.var (0.5.x).
+        means = np.asarray(dds.var["_normed_means"])
+        genewise = np.asarray(dds.var["genewise_dispersions"])
+        fitted = np.asarray(dds.var["fitted_dispersions"])
+        final = np.asarray(dds.var["dispersions"])
+        ok = (means > 0) & np.isfinite(genewise)
 
         fig, ax = plt.subplots(figsize=(6.5, 5))
         ax.scatter(means[ok], genewise[ok], s=4, color="black", alpha=0.3, label="genewise")
@@ -624,15 +622,13 @@ def paired_vs_unpaired(counts_f, coldata, res, n_sig_paired, figdir):
 
     counts_sxg = counts_f.T
     metadata = coldata.set_index("ID")[["cellLine", "treatment"]].loc[counts_sxg.index]
-    metadata["treatment"] = metadata["treatment"].astype(str)
+    metadata["treatment"] = pd.Categorical(
+        metadata["treatment"], categories=["Untreated", "Dexamethasone"]
+    )
     inference = DefaultInference()
 
-    common = dict(counts=counts_sxg, metadata=metadata,
-                  ref_level=["treatment", "Untreated"], inference=inference)
-    try:
-        dds_u = DeseqDataSet(design="~treatment", **common)
-    except TypeError:
-        dds_u = DeseqDataSet(design_factors=["treatment"], **common)
+    dds_u = DeseqDataSet(counts=counts_sxg, metadata=metadata,
+                         design="~treatment", refit_cooks=True, inference=inference)
     dds_u.deseq2()
 
     stat_u = DeseqStats(dds_u, contrast=COEF_CONTRAST, inference=inference)
@@ -705,7 +701,7 @@ def main(argv=None) -> int:
     label_of, symbol_of = make_labeller(symbol_map)
 
     # 3. Fit + results
-    dds = run_deseq(counts_f, coldata, design_factors=["cellLine", "treatment"])
+    dds = run_deseq(counts_f, coldata)
     res, n_sig = extract_results(dds, symbol_of)
 
     top = res.head(20).copy()

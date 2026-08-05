@@ -496,12 +496,39 @@ rownames(mat) <- top_genes$label
 
 annotation_col <- as.data.frame(colData(vsd)[, c("treatment", "cellLine")])
 
+# Summery diverging map for the centred VST values: cool teal (below the gene's
+# mean) -> low-chroma cream (at the mean) -> warm coral (above). This keeps the
+# diverging rule intact (two hues + a neutral midpoint, no saturated hue at zero)
+# while giving a beachier feel than red/blue.
+summer_diverging <- colorRampPalette(
+  c("#17726B", "#4FB0A5", "#F2ECDB", "#F0A868", "#D6452C")
+)(255)
+
+# Symmetric breaks so the neutral cream sits exactly at 0 (= "at the gene's mean").
+# Without this, pheatmap stretches the palette across the raw min/max and the
+# neutral colour drifts off zero, misreading the diverging scale.
+max_abs <- max(abs(mat))
+sym_breaks <- seq(-max_abs, max_abs, length.out = length(summer_diverging) + 1)
+
+# Categorical annotation colours. Donor uses an Okabe-Ito-derived set (built to be
+# colourblind-safe); treatment keeps the baseline recessive (sand) and lets the
+# active condition pop (coral).
+ann_colors <- list(
+  treatment = c(Untreated = "#CBBBA0", Dexamethasone = "#E4572E"),
+  cellLine  = c(N61311 = "#E69F00", N052611 = "#009E73",
+                N080611 = "#56B4E9", N061011 = "#CC79A7")
+)
+
 heatmap_args <- list(
   mat = mat,
   annotation_col = annotation_col,
+  annotation_colors = ann_colors,
   show_colnames = TRUE,
   cluster_cols = TRUE,
-  color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(255),
+  color = summer_diverging,
+  breaks = sym_breaks,
+  border_color = "white",
+  fontsize_row = 8,
   main = "Top 30 DE genes (centred VST)"
 )
 

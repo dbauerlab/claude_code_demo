@@ -1,0 +1,269 @@
+---
+title: "Comparing agentic RNA-seq analyses across branches"
+subtitle: "One airway dataset, ten agentic analyses — how they converged, where they diverged, and how correct they were"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    df-print: kable
+    embed-resources: true
+    fig-align: center
+    code-fold: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(knitr)
+D <- "data"; FIG <- "figures"
+tab <- function(f, ...) kable(read.csv(file.path(D, f), check.names = FALSE), ...)
+```
+
+# Overview
+
+Every `demo/*` branch of this repository is an **independent agentic analysis of the same
+dataset** — the *airway* experiment (Himes et al. 2014): human airway smooth-muscle cells
+from four donors, each sequenced untreated and dexamethasone-treated, quantified with RSEM
+(~58,735 genes × 8 samples). Each branch was produced by a different person driving an AI
+coding agent toward the same goal: **differential expression, Dexamethasone vs Untreated.**
+
+This report compares **ten** of those branches (all except `yangz`, which is data-only) across
+the three artefacts the agents produced — the **`CLAUDE.md`** context file, the **analysis
+script**, and the **results** — and assesses **how correct** each analysis was against an
+independent, published reference.
+
+::: {.callout-note}
+## Method in one paragraph
+We re-ran every branch we could from source (R/DESeq2 via `knitr::purl`; PyDESeq2 in a Python
+3.12 env; clawbio branches from their committed output, since the clawbio engine was not
+available here), harmonized each DE table to a common schema, and scored them against a
+**gold-standard reference**: the canonical DESeq2 workflow on the *published* Bioconductor
+`airway` package (`~ cell + dex`, Untreated reference, apeglm shrinkage) — deliberately a
+*different* quantification than this repo's RSEM matrix, so concordance is judged on
+**rank, overlap, direction and marker recovery** rather than absolute fold-change. All numbers
+below are computed by the harness in `analysis/harness/` and read from `analysis/data/`.
+:::
+
+## Execution status {#sec-exec}
+
+Eight branches were re-executed end-to-end; `barretj` is compared from its committed clawbio
+output; `davidlvb` is assessed from source only (its clawbio engine could not be regenerated
+here and it committed no results).
+
+```{r exec}
+tab("execution_status.csv")
+```
+
+# Layer 1 — the `CLAUDE.md` context files
+
+The `CLAUDE.md` is the context each agent was given (or wrote) about the dataset. We scored
+each against a fixed **16-point rubric** of correct, analysis-critical facts, by objective
+keyword presence.
+
+```{r fig-cov}
+#| fig-cap: "Coverage of each key analysis fact across the ten CLAUDE.md files (rows ordered by total coverage)."
+include_graphics(file.path(FIG, "fig1_claudemd_coverage.png"))
+```
+
+**Consensus.** Ten out of ten correctly identify the dataset, state the analysis
+language/deliverable convention, note that the two files join on sample **ID** (not position),
+and flag that the `transcript_id(s)` column must be dropped. The paired design and the
+`~ cellLine + treatment` formula are near-universal (9/10 and 8/10).
+
+**Divergence.** The files split sharply on the *measured* details that separate a generic
+dataset description from an analysis-ready brief:
+
+- **Pre-filtering** is mentioned by only **3/10** (tiph, pateld1, marga).
+- **Marker genes** for a biological sanity check and **library-size variation** appear in only
+  **2/10** (tiph, marga).
+- The **sign-flip risk** from R's alphabetical factor default is warned about in **4/10**.
+
+```{r fig-size}
+#| fig-cap: "Context richness: rubric coverage (bars) and word count (fill). tiph and marga lead at 16/16; santosnuno is leanest at 6/16."
+include_graphics(file.path(FIG, "fig2_claudemd_size.png"))
+```
+
+**Accuracy.** Every quantitative claim we could check was **correct**: the branches that cite
+measured numbers (tiph, marga, pateld1) state 58,735 genes, 28,344 all-zero (48.3%), 11,117
+non-integer rows, and 14.9–30.3 M library sizes — all verified exactly against the data. No
+`CLAUDE.md` contained a false statement; the differences are of **depth, not accuracy**. The
+files that "measured the data" (tiph, marga, pateld1) produced richer briefs — but, as Layer 2
+shows, the leaner briefs still yielded correct analyses, because the omitted facts (round,
+filter, reference level) are also DESeq2 standard practice and were applied in code regardless.
+
+# Layer 2 — the analysis scripts
+
+```{r fig-matrix}
+tab("script_matrix.csv")
+```
+
+**The consensus recipe.** Independently, all ten converged on the *same* statistically-correct
+pipeline:
+
+1. **Design `~ cellLine + treatment`** — the paired/blocked design, in every branch. None
+   fell into the "4-vs-4 unpaired" trap that was flagged as the most likely mistake.
+2. **`Untreated` as reference** — set explicitly everywhere (via `relevel`, explicit factor
+   levels, category reorder, or clawbio's contrast direction), so a positive LFC = induced.
+3. **Round RSEM counts to integers** before modelling.
+4. **Low-count pre-filter**, then **apeglm/clawbio LFC shrinkage**, **BH-adjusted** p-values
+   at **padj < 0.05**, and **VST** for PCA/clustering.
+5. **The full diagnostic suite** — PCA, volcano, MA, sample-distance, and expression heatmaps
+   appear in nearly every branch.
+
+**Where they diverged (all defensible):**
+
+- **Engine.** Seven used **R/DESeq2**; `pateld1` used **PyDESeq2**; `barretj` and `davidlvb`
+  used the **clawbio** skill (a PyDESeq2 wrapper). This is the single biggest split and the one
+  visible in the outputs (Layer 3).
+- **Low-count filter.** Total-count ≥ 10 (Catarina, marga, okp-23, pateld1) vs ≥ 10 in ≥ 4
+  samples (Olivia, santosnuno, becky, tiph) vs ≥ 10 in ≥ 2 (davidlvb) vs clawbio's default
+  (barretj). This changes *genes tested* substantially but *significant genes* barely (Layer 3).
+- **Symbol mapping.** All but **becky** map Ensembl IDs to symbols (becky stays in Ensembl IDs).
+- **Scope & polish.** `davidlvb` alone adds **pathway enrichment**; `okp-23` ships **reusable
+  skills with unit tests**; `pateld1` adds a **paired-vs-unpaired sensitivity check** and
+  assertion guards; `barretj` ships a **full reproducibility bundle**; `tiph`/`marga` invest in
+  report styling.
+
+**Correctness review.** Reading every script, we found **no correctness-breaking bug**: no
+dropped blocking factor, no mis-set reference, no `floor()`/truncation of counts. Two branches
+show notable defensive engineering — `pateld1` encodes every consistency check as a runtime
+assertion (and handles the PyDESeq2 0.5.x reference-level API), and `tiph` degrades gracefully
+from apeglm to `normal` shrinkage if apeglm is absent. `davidlvb` documents a real clawbio
+Enrichr bug and works around it with `gseapy`.
+
+# Layer 3 — the results
+
+## Genes tested vs significant
+
+```{r fig-ngenes}
+#| fig-cap: "The filter choice moves the number of genes *tested* by ~35% (15.2k–20.8k) but the number of *significant* genes barely at all."
+include_graphics(file.path(FIG, "fig6_ngenes.png"))
+```
+
+The low-count filter is the most visible methodological choice, yet DESeq2's independent
+filtering absorbs most of it: R/DESeq2 branches call **3,917–3,950** significant genes
+regardless of filter, while the PyDESeq2 (`pateld1`, 3,629) and clawbio (`barretj`, 3,662)
+engines run slightly more conservative.
+
+## Cross-branch agreement
+
+```{r fig-pair}
+#| fig-cap: "Pairwise Spearman correlation of per-gene log2FC. Median across all pairs = 1.00."
+include_graphics(file.path(FIG, "fig3_pairwise_lfc.png"))
+```
+
+```{r fig-jac}
+#| fig-cap: "Pairwise Jaccard overlap of significant (padj<0.05) gene sets. Median = 0.955."
+include_graphics(file.path(FIG, "fig4_sig_jaccard.png"))
+```
+
+On the shared RSEM matrix the branches are **almost indistinguishable**: median pairwise
+Spearman LFC = **1.00**, median significant-set Jaccard = **0.955**. `barretj` (clawbio) is the
+only mild outlier (0.96–0.98), reflecting its different filter and engine. **3,491 genes are
+significant in *all* nine quantitatively-compared branches** — and **94% of that core set is
+also significant in the independent airway reference.**
+
+## Concordance with the published reference
+
+```{r fig-ref}
+#| fig-cap: "Each branch vs the published airway reference: log2FC correlation, top-100 overlap, and significant-set Jaccard."
+include_graphics(file.path(FIG, "fig5_vs_reference.png"))
+```
+
+```{r fig-scatter}
+#| fig-cap: "Per-gene log2FC vs the airway reference for a DESeq2 branch (tiph) and a PyDESeq2 branch (pateld1). Dashed line = identity."
+include_graphics(file.path(FIG, "fig8_lfc_scatter.png"))
+```
+
+Against a *different quantification* of the same experiment, every branch lands at Pearson LFC
+**0.90–0.97** and top-100 overlap **0.86–0.93**. The `≥10-in-≥4-samples` branches
+(becky, Olivia, santosnuno, tiph) correlate best (0.967) — a slightly stricter filter drops
+noisy low-count genes and tightens agreement with the reference.
+
+```{r metrics-tab}
+tab("output_metrics.csv", digits = 3)
+```
+
+## Biological validity
+
+```{r fig-mark}
+#| fig-cap: "log2FC of known glucocorticoid-responsive genes. Every branch matches the reference: strong induction of SPARCL1/ZBTB16/KLF15/DUSP1/etc., and CCL2 repressed."
+include_graphics(file.path(FIG, "fig7_markers.png"))
+```
+
+This is the strongest evidence that all agents recovered the **correct biology**: for the known
+responders, every branch reproduces the reference log2FC to within rounding (SPARCL1 ≈ 4.6,
+ZBTB16 ≈ 7.3, KLF15 ≈ 4.4, DUSP1 ≈ 3.0), and CCL2 is repressed everywhere. Direction agreement
+with the reference on co-significant genes is **100% in every branch**.
+
+# Correctness scorecard
+
+Synthesising all layers into five explicit dimensions (each 0–1; composite = their mean).
+A/B come from the verified script matrix, C/D from computed metrics, E is a transparent
+reviewer rubric over committed reproducibility artefacts.
+
+```{r fig-score}
+#| fig-cap: "A: paired-design correctness · B: statistical hygiene · C: biological validity · D: concordance vs reference · E: reproducibility."
+include_graphics(file.path(FIG, "fig9_scorecard.png"))
+```
+
+```{r score-tab}
+tab("correctness_scorecard.csv", digits = 3)
+```
+
+**Every branch is statistically and biologically correct** (A, B, C at ceiling). Branches
+separate almost entirely on **reproducibility (E)** and marginally on **concordance (D)**.
+`barretj` leads on the strength of a full reproducibility bundle (checksums, pinned
+environment, replayable commands); `pateld1` follows (assertions, pinned requirements, seed);
+the tightly-filtered R branches (`tiph`, `Olivia`, `santosnuno`, `becky`) score highest on
+concordance. `davidlvb`'s C/D are `n/a` (its clawbio output could not be regenerated here); its
+method mirrors `barretj`.
+
+# Consensus vs divergence — the bottom line
+
+**Consensus (what every agent got right).** Same dataset understanding, same paired design,
+same reference level, same core statistical recipe, and — most importantly — **the same
+answer**: a ~3,500-gene core DE set, recovered in every branch, 94% of it confirmed by an
+independent published reference, with all known glucocorticoid markers induced in the correct
+direction. The agentic analyses are **reproducible and correct**, and they agree with each
+other to a near-perfect degree.
+
+**Divergence (where taste and tooling showed).** The differences are real but sit *above* the
+statistics: choice of **engine** (R/DESeq2 vs PyDESeq2 vs clawbio — the only choice that
+visibly moved the significant-gene count), **filter stringency** (shifts genes-tested, not
+conclusions), **symbol annotation**, and **how far past core DE** each went — enrichment
+(davidlvb), reusable tested skills (okp-23), reproducibility rigor (barretj, pateld1),
+sensitivity analysis (pateld1), and report polish (tiph, marga). The `CLAUDE.md` files varied
+most of all (6/16 to 16/16 coverage), yet that variance **did not propagate to the results** —
+the standard-practice steps some briefs omitted were applied in code anyway.
+
+**How correct were they? Uniformly correct.** No branch made a design or statistical error that
+changed the biology. The spread that remains is a spread in **engineering quality and scope**,
+not in scientific validity.
+
+# Caveats & limitations {.unnumbered}
+
+- **Reference quantification differs.** The airway package's counts come from a different
+  pipeline than this repo's RSEM matrix, so we weight rank/overlap/direction/marker recovery
+  over absolute LFC. Cross-branch agreement (all on the identical RSEM matrix) is the tighter,
+  secondary anchor and shows near-perfect consensus.
+- **Best-effort execution.** `barretj` is compared from committed clawbio output and `davidlvb`
+  from source only (clawbio/`uvx` unavailable in this environment). The eight re-run branches
+  reproduce their committed results where those exist (e.g. becky's 3,950 significant genes).
+- **Harvesting.** For R branches without a committed results CSV, an *additive, export-only*
+  step serialised the branch's own final results object — no statistical step was reimplemented
+  or altered.
+- **Rubric subjectivity.** Layer-1 coverage and the reproducibility dimension (E) are
+  reviewer rubrics; Layers 2–3 (methods, correlations, overlaps, marker recovery) are objective.
+
+::: {.callout-tip}
+## Reproduce this report
+`analysis/harness/` holds the full pipeline: `install_bioc.R` → `build_reference.R` →
+`materialize.sh` → `run_r_branch.R` (+ PyDESeq2 env for pateld1) → `compute_metrics.R` →
+`score_claudemd.R` → `build_scorecard.R` → `make_figures.R`, then render this `.qmd`.
+:::

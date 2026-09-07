@@ -1,0 +1,6 @@
+branches_compared_quantitatively: 9 (barretj, becky, Catarina, marga, okp-23, Olivia, pateld1, santosnuno, tiph)
+reference_sig: 4030
+core_sig_in_all_branches: 3491
+core_also_sig_in_reference: 3280 (94.0%)
+median_pairwise_spearman_LFC: 1.000
+median_pairwise_sig_jaccard: 0.955

@@ -1,0 +1,11 @@
+branch,engine,execution,how,genes_tested,notes
+Catarina,R / DESeq2,re-ran,knitr::purl + Rscript (DESeq2 1.46),20803,export-only harvest of `res` object
+Olivia,R / DESeq2,re-ran,knitr::purl + Rscript,15478,clean run
+santosnuno,R / DESeq2,re-ran,knitr::purl + Rscript,15478,clean run
+okp-23,R / DESeq2,re-ran,knitr::purl + Rscript,20803,re-run reproduces committed results table
+becky,R / DESeq2,re-ran,knitr::purl + Rscript,15478,re-run reproduces committed 3950 sig exactly
+tiph,R / DESeq2,re-ran,knitr::purl + Rscript,15478,graceful apeglm->normal fallback path
+marga,R / DESeq2,re-ran,knitr::purl + Rscript,20803,clean run
+pateld1,PyDESeq2,re-ran,python analyze.py (pydeseq2 0.5.4 / py3.12),20803,ran incl. paired-vs-unpaired sensitivity
+barretj,clawbio / PyDESeq2,committed-output,clawbio MCP unavailable (no uvx),16477,used committed de_results.csv (clawbio-generated)
+davidlvb,clawbio / PyDESeq2,code-only,clawbio marketplace skill unavailable; no committed output,NA,method assessed from source; mirrors barretj engine

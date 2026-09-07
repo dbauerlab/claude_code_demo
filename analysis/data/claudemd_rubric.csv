@@ -1,0 +1,11 @@
+"branch","words","lines","headings","code_blocks","coverage","dataset_airway","paired_design","formula","ref_untreated","signflip_warning","round_counts","round_rationale","prefilter","join_by_id","drop_transcript","ensembl_unversioned","symbol_mapping","libsize_var","marker_genes","lang_convention","quant_facts"
+"Catarina",430,56,5,0,11,1,1,1,1,0,1,1,0,1,1,1,0,0,0,1,1
+"Olivia",320,27,5,0,13,1,1,1,1,1,1,1,0,1,1,1,1,0,0,1,1
+"santosnuno",179,19,4,0,6,1,0,0,0,0,1,0,0,1,1,0,0,0,0,1,1
+"okp-23",268,19,4,0,8,1,1,0,0,0,1,1,0,1,1,0,0,0,0,1,1
+"becky",317,25,5,0,8,1,1,1,1,0,1,0,0,1,1,0,0,0,0,1,0
+"tiph",577,60,6,3,16,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
+"barretj",315,26,5,0,9,1,1,1,1,0,1,0,0,1,1,0,0,0,0,1,1
+"pateld1",394,28,3,0,12,1,1,1,0,0,1,1,1,1,1,1,1,0,0,1,1
+"davidlvb",504,31,5,0,11,1,1,1,1,1,1,1,0,1,1,0,0,0,0,1,1
+"marga",579,49,6,1,16,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
